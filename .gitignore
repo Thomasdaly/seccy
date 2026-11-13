@@ -1,0 +1,24 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# data, volumes, evidence (may contain PII/secrets)
+data/
+artifacts/
+findings/
+*.sqlite
+
+# logs
+*.log
+
+# os / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

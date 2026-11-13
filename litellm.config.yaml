@@ -1,0 +1,14 @@
+model_list:
+  # Tier 0 — local, free, high-volume glue
+  - model_name: glue
+    litellm_params: { model: ollama/qwen3:8b, api_base: http://localhost:11434 }
+  - model_name: embed
+    litellm_params: { model: ollama/bge-m3, api_base: http://localhost:11434 }
+  # Tier 1 — hosted open, cheap reasoning (~1/6 frontier cost)
+  - model_name: planner
+    litellm_params: { model: openrouter/z-ai/glm-4.6 }
+  # Tier 2 — frontier, hard steps only
+  - model_name: judge
+    litellm_params: { model: anthropic/claude-<current> }
+litellm_settings:
+  success_callback: ["langfuse"]     # every call → cost + trace
