@@ -1,19 +1,52 @@
+# Services runner (2060 / WSL2). Ports bind to TAILNET_IP only, so nothing is
+# exposed on the LAN (WSL mirrored networking would otherwise publish to it).
+# Needs tailscale0 up before Docker starts; see README.
+x-common: &common
+  restart: unless-stopped
+
 services:
   litellm:
+    <<: *common
     image: ghcr.io/berriai/litellm:main-latest
     command: ["--config", "/app/config.yaml", "--port", "4000"]
-    volumes: ["./litellm.config.yaml:/app/config.yaml"]
-    ports: ["4000:4000"]
-    env_file: .env            # OPENROUTER_API_KEY, ANTHROPIC_API_KEY, etc.
+    volumes: ["./litellm.config.yaml:/app/config.yaml:ro"]
+    ports: ["${TAILNET_IP:-127.0.0.1}:4000:4000"]
+    env_file: .env            # LITELLM_MASTER_KEY, OPENROUTER_API_KEY, ANTHROPIC_API_KEY, LANGFUSE_*
     extra_hosts: ["host.docker.internal:host-gateway"]
+
   qdrant:
+    <<: *common
     image: qdrant/qdrant:latest
-    ports: ["6333:6333"]
+    ports: ["${TAILNET_IP:-127.0.0.1}:6333:6333"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+
   postgres:
+    <<: *common
     image: postgres:17
-    environment: { POSTGRES_PASSWORD: change-me }
-    ports: ["5432:5432"]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports: ["${TAILNET_IP:-127.0.0.1}:5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Pinned to v2: v3 additionally needs ClickHouse, Redis and S3/MinIO.
   langfuse:
-    image: langfuse/langfuse:latest
-    ports: ["3000:3000"]
-    environment: { DATABASE_URL: postgresql://postgres:change-me@postgres:5432/langfuse }
+    <<: *common
+    image: langfuse/langfuse:2
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["${TAILNET_IP:-127.0.0.1}:3000:3000"]
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      NEXTAUTH_URL: http://${TAILNET_IP:-127.0.0.1}:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET in .env}
+      SALT: ${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
+      TELEMETRY_ENABLED: "false"
+
+volumes:
+  pgdata:
+  qdrant_data:
