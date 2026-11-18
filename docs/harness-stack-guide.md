@@ -167,9 +167,9 @@ Point the harness at the router over the tailnet: `LITELLM_BASE_URL=http://<2060
 model_list:
   # Tier 0 — local, free, high-volume glue
   - model_name: glue
-    litellm_params: { model: ollama/qwen3:8b, api_base: http://localhost:11434 }
+    litellm_params: { model: ollama/qwen3:8b, api_base: http://host.docker.internal:11434 }
   - model_name: embed
-    litellm_params: { model: ollama/bge-m3, api_base: http://localhost:11434 }
+    litellm_params: { model: ollama/bge-m3, api_base: http://host.docker.internal:11434 }
   # Tier 1 — hosted open, cheap reasoning (~1/6 frontier cost)
   - model_name: planner
     litellm_params: { model: openrouter/z-ai/glm-4.6 }
