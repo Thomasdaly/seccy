@@ -22,3 +22,6 @@ findings/
 *.swp
 .idea/
 .vscode/
+
+# windows download metadata
+*:Zone.Identifier
