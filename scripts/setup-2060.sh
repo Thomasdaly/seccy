@@ -45,6 +45,10 @@ export OLLAMA_HOST=$OLLAMA_ADDR
 for m in qwen3:8b bge-m3; do
   ollama list | awk 'NR>1{print $1}' | grep -qE "^${m}(:latest)?$" || ollama pull "$m"
 done
+# CPU-only embedding model: qwen3:8b already overflows the 6 GB GPU, and letting
+# bge-m3 share it makes Ollama evict and reload models (20-90s per switch).
+printf 'FROM bge-m3\nPARAMETER num_gpu 0\n' > /tmp/Modelfile.bge-m3-cpu
+ollama create bge-m3-cpu -f /tmp/Modelfile.bge-m3-cpu >/dev/null
 ollama list
 
 step "compose"
