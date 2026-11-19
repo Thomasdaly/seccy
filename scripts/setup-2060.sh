@@ -24,6 +24,8 @@ cat > /etc/systemd/system/ollama.service.d/override.conf <<EOF
 After=docker.service
 [Service]
 Environment="OLLAMA_HOST=$OLLAMA_ADDR"
+# keep models resident: a qwen3:8b reload from the WSL disk takes ~90s
+Environment="OLLAMA_KEEP_ALIVE=-1"
 EOF
 cat > /etc/systemd/system/docker.service.d/override.conf <<'EOF'
 [Unit]
