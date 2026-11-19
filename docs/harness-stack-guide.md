@@ -7,7 +7,7 @@
 ## 1. Design principles
 
 1. **The harness is the moat, not the model.** Every model is a swappable endpoint behind one router. When a better/cheaper open model ships, you change one config line.
-2. **Three cost tiers.** Local models do high-volume glue for free; hosted *open* models (GLM/DeepSeek/Qwen) do cheap reasoning at ~1/6 frontier price; a frontier model is called only on hard steps or to make the final finding judgment.
+2. **Three cost tiers.** Local models do high-volume glue for free; hosted *open* models (GLM/DeepSeek/Qwen) do cheap reasoning at ~1/16–1/20 of the frontier price (GLM-4.6 $0.50/$2 vs Claude Fable 5.2 $8/$40 per M tokens); a frontier model is called only on hard steps or to make the final finding judgment.
 3. **No evidence, no report.** Nothing becomes a "finding" until the harness has a replayable request/response pair that proves it. This is what separates earning hunters from the slop that got programs shut down.
 4. **Isolate reproduction from credentials.** The box that holds your API keys and session tokens must never be the box that executes untrusted replay steps. (Elastic's public triage design self-destructs the repro VM after 30 minutes for exactly this reason.)
 5. **Everything is metered.** You can't manage "cost per accepted report" if you can't see token spend per run.
@@ -170,12 +170,12 @@ model_list:
     litellm_params: { model: ollama/qwen3:8b, api_base: http://host.docker.internal:11434 }
   - model_name: embed
     litellm_params: { model: ollama/bge-m3, api_base: http://host.docker.internal:11434 }
-  # Tier 1 — hosted open, cheap reasoning (~1/6 frontier cost)
+  # Tier 1 — hosted open, cheap reasoning (~1/16–1/20 frontier cost)
   - model_name: planner
     litellm_params: { model: openrouter/z-ai/glm-4.6 }
   # Tier 2 — frontier, hard steps only
   - model_name: judge
-    litellm_params: { model: anthropic/claude-<current> }
+    litellm_params: { model: anthropic/claude-fable-5-2 }
 litellm_settings:
   success_callback: ["langfuse"]     # every call → cost + trace
 ```

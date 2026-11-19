@@ -4,7 +4,7 @@ model_list:
     litellm_params: { model: ollama/qwen3:8b, api_base: http://host.docker.internal:11434, think: false, keep_alive: "-1m" }   # no reasoning tokens; stay loaded
   - model_name: embed
     litellm_params: { model: ollama/bge-m3-cpu, api_base: http://host.docker.internal:11434, keep_alive: "-1m" }   # CPU-only copy: keeps the 6 GB GPU for qwen3
-  # Tier 1 — hosted open, cheap reasoning (~1/6 frontier cost)
+  # Tier 1 — hosted open, cheap reasoning (~1/16–1/20 frontier cost)
   - model_name: planner
     # LiteLLM has no price for this model, so spend logged as $0. OpenRouter list
     # price as of 2026-11-19 ($0.50 / $2.00 per M tokens); recheck when it changes.
