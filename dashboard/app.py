@@ -24,6 +24,7 @@ from backend import RANGES, Backend
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per upstream call is noise
 
 PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 DEMO = os.environ.get("DASHBOARD_DEMO") == "1"
