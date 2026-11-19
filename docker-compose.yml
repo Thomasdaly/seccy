@@ -142,6 +142,34 @@ services:
       timeout: 5s
       retries: 15
 
+  # --- Dashboard: health, trends, flows, raw data (dashboard/README.md) ---------
+  dashboard:
+    <<: *common
+    build: ./dashboard
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["${TAILNET_IP:-127.0.0.1}:8080:8080"]
+    # Only the secrets it needs (no env_file): LiteLLM key for the route list,
+    # Langfuse project keys for reads, its own read-only DB role.
+    environment:
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
+      DASHBOARD_DATABASE_URL: postgresql://dashboard_ro:${DASHBOARD_DB_PASSWORD:?set DASHBOARD_DB_PASSWORD in .env}@postgres:5432/postgres
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_UI_URL: http://${TAILNET_IP:-127.0.0.1}:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_URL: http://host.docker.internal:11434
+      PROBE_LANGFUSE_WORKER: http://langfuse-worker:3030
+      PROBE_CLICKHOUSE: http://clickhouse:8123
+      PROBE_REDIS: redis:6379
+      PROBE_MINIO: http://minio:9000
+      LITELLM_CONFIG: /app/litellm.config.yaml
+    volumes: ["./litellm.config.yaml:/app/litellm.config.yaml:ro"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
 volumes:
   pgdata:
   qdrant_data:

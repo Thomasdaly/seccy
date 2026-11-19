@@ -305,12 +305,12 @@ function renderHealth(d) {
 
   const ol = d.services.find((x) => x.name === "ollama")?.detail || {};
   const loaded = new Map((ol.loaded || []).map((m) => [m.name, m]));
-  const ollamaCard = card("Ollama models", "Resident = loaded in memory now. Below 100% GPU means CPU fallback.",
+  const ollamaCard = card("Ollama models", "Resident = loaded now. qwen3:8b overflows the 6 GB card, so partial GPU is normal; 0% on a GPU model means CUDA fallback.",
     table([
       { label: "Model", render: (m) => h("span", { class: "mono" }, m.name) },
       { label: "Params", key: "params" }, { label: "Quant", key: "quant" },
       { label: "Size", key: "size", fmt: fmtBytes, align: "r" },
-      { label: "Resident", render: (m) => { const l = loaded.get(m.name); return l ? badge(l.gpu_pct >= 100 ? "good" : "warning", `${l.gpu_pct}% GPU · unloads ${fmtIn(l.expires_at)}`) : h("span", { class: "muted" }, "no"); } },
+      { label: "Resident", render: (m) => { const l = loaded.get(m.name); if (!l) return h("span", { class: "muted" }, "no"); const cpu = /-cpu(:|$)/.test(m.name); return badge(cpu || l.gpu_pct >= 50 ? "good" : l.gpu_pct === 0 ? "critical" : "warning", `${cpu ? "CPU by design" : `${l.gpu_pct}% GPU`} · ${l.expires_at && l.expires_at - Date.now() / 1000 < 30 * 86400 ? "unloads " + fmtIn(l.expires_at) : "pinned"}`); } },
     ], ol.installed || [], { empty: "Ollama unreachable or no models pulled." }));
 
   const qd = d.services.find((x) => x.name === "qdrant")?.detail || {};

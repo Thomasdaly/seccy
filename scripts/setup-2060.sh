@@ -56,11 +56,15 @@ ollama list
 step "compose"
 cd "$REPO"
 [ -f .env ] || { echo "missing $REPO/.env (copy .env.example and fill it)"; exit 1; }
-docker compose pull
+docker compose pull --ignore-buildable   # dashboard is built locally
 docker compose up -d --wait postgres
 docker compose exec -T postgres psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='langfuse'" | grep -q 1 \
   || docker compose exec -T postgres createdb -U postgres langfuse
-docker compose up -d --remove-orphans
+# Harness findings schema + the dashboard's read-only role (idempotent)
+DB_RO=$(grep '^DASHBOARD_DB_PASSWORD=' .env | cut -d= -f2-)
+[ -n "$DB_RO" ] || { echo "set DASHBOARD_DB_PASSWORD in .env"; exit 1; }
+docker compose exec -T postgres psql -U postgres -q -v ON_ERROR_STOP=1 -v ro_password="$DB_RO" < db/harness.sql
+docker compose up -d --build --remove-orphans
 
 step "health (waiting up to 3 min for langfuse + clickhouse migrations)"
 IP=$(tailscale ip -4)
@@ -77,6 +81,7 @@ fail=0
 wait_for litellm  "http://$IP:4000/health/liveliness"  || fail=1
 wait_for qdrant   "http://$IP:6333/healthz"            || fail=1
 wait_for langfuse "http://$IP:3000/api/public/health"  || fail=1
+wait_for dashboard "http://$IP:8080/healthz"           || fail=1
 
 step "glue route: litellm -> ollama"
 curl -s -m 120 "http://$IP:4000/v1/chat/completions" \

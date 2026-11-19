@@ -17,7 +17,7 @@ TARGETS = [("juice-shop.lab", "lab"), ("crapi.lab", "lab"), ("vampi.lab", "lab")
 PATHS = ["/api/Users/{id}", "/api/BasketItems/{id}", "/rest/basket/{id}", "/identity/api/v2/vehicle/{id}/location",
          "/workshop/api/shop/orders/{id}", "/users/v1/{username}", "/books/v1/{title}", "/tenants/{tid}/invoices/{id}",
          "/tenants/{tid}/members", "/api/Feedbacks/{id}", "/community/api/v2/community/posts/{id}", "/api/Cards/{id}"]
-MODELS = {"glue": "qwen3:8b", "embed": "bge-m3", "planner": "z-ai/glm-4.6", "judge": "claude-sonnet-5-5"}
+MODELS = {"glue": "qwen3:8b", "embed": "bge-m3-cpu", "planner": "z-ai/glm-4.6", "judge": "claude-sonnet-5-5"}
 STEPS = {"glue": "observe", "embed": "dedup_embed", "planner": "plan_probes", "judge": "judge_finding"}
 
 
@@ -46,7 +46,7 @@ class DemoBackend(Backend):
     def __init__(self) -> None:
         super().__init__()
         if not self.routes:
-            self.routes = {"glue": "ollama/qwen3:8b", "embed": "ollama/bge-m3",
+            self.routes = {"glue": "ollama/qwen3:8b", "embed": "ollama/bge-m3-cpu",
                            "planner": "openrouter/z-ai/glm-4.6", "judge": "anthropic/claude-<current>"}
         self._build(random.Random(7))
         self._fake_history(random.Random(11))
@@ -174,10 +174,12 @@ class DemoBackend(Backend):
              "detail": {"version": "1.80.0", "langfuse_callback": True, "routes": len(self.routes)}},
             {"name": "ollama", "ok": True, "ms": 8.9, "error": None, "detail": {
                 "version": "0.12.6",
-                "loaded": [{"name": "qwen3:8b", "size": 6_200_000_000, "size_vram": 6_200_000_000, "gpu_pct": 100, "expires_at": now + 240}],
+                "loaded": [{"name": "qwen3:8b", "size": 7_100_000_000, "size_vram": 5_900_000_000, "gpu_pct": 83, "expires_at": None},
+                           {"name": "bge-m3-cpu:latest", "size": 1_300_000_000, "size_vram": 0, "gpu_pct": 0, "expires_at": None}],
                 "installed": [
                     {"name": "qwen3:8b", "size": 5_225_000_000, "family": "qwen3", "params": "8.2B", "quant": "Q4_K_M", "modified_at": now - 30 * 86400},
-                    {"name": "bge-m3:latest", "size": 1_157_000_000, "family": "bert", "params": "566.70M", "quant": "F16", "modified_at": now - 30 * 86400}]}},
+                    {"name": "bge-m3:latest", "size": 1_157_000_000, "family": "bert", "params": "566.70M", "quant": "F16", "modified_at": now - 30 * 86400},
+                    {"name": "bge-m3-cpu:latest", "size": 1_157_000_000, "family": "bert", "params": "566.70M", "quant": "F16", "modified_at": now - 86400}]}},
             {"name": "qdrant", "ok": True, "ms": 2.7, "error": None, "detail": {
                 "version": "1.15.4",
                 "collections": [{"name": "findings", "status": "green", "points": sum(1 for v in self.verdicts if v["label"] == "confirmed"),

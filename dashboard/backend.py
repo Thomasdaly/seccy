@@ -190,6 +190,15 @@ async def probe(name: str, fn) -> dict:
     return {"name": name, "ok": ok, "ms": round((time.perf_counter() - t0) * 1000, 1), "error": err, "detail": detail}
 
 
+def _bare(model: str) -> str:
+    return model.split("/", 1)[-1].removesuffix(":latest")
+
+
+def _cpu_by_design(model: str) -> bool:
+    """setup-2060.sh builds CPU-only copies (num_gpu 0) named *-cpu."""
+    return _bare(model).split(":")[0].endswith("-cpu")
+
+
 def load_config_routes(path: str) -> dict[str, str]:
     try:
         with open(path) as f:
@@ -486,8 +495,8 @@ class Backend:
             reasons.append(f"slow probe ({s['ms']:.0f} ms)")
         if s["name"] == "ollama":
             for m in d.get("loaded", []):
-                if m.get("gpu_pct") is not None and m["gpu_pct"] < 100:
-                    reasons.append(f"{m['name']} only {m['gpu_pct']}% in VRAM (CPU fallback)")
+                if m.get("gpu_pct") == 0 and not _cpu_by_design(m["name"]):
+                    reasons.append(f"{m['name']} running entirely on CPU (CUDA fallback?)")
         if s["name"] == "langfuse" and d.get("api_error"):
             reasons.append(f"API: {d['api_error']}")
         if s["name"] == "postgres" and d.get("max_conns") and d.get("conns", 0) > 0.8 * d["max_conns"]:
@@ -533,18 +542,33 @@ class Backend:
                                else "Every route in litellm.config.yaml names a concrete model.")})
 
         ol = by.get("ollama", {})
-        loaded = (ol.get("detail") or {}).get("loaded") or []
+        loaded = {_bare(m["name"]): m for m in (ol.get("detail") or {}).get("loaded") or []}
+        local = {r: _bare(m) for r, m in self.routes.items() if m.startswith("ollama/")}
         if not ol.get("ok"):
             g = {"status": "unknown", "value": "—", "detail": "Ollama unreachable."}
-        elif not loaded:
-            g = {"status": "unknown", "value": "cold", "detail": "No model resident; the next glue call pays the load time."}
+        elif not local:
+            g = {"status": "unknown", "value": "no local routes", "detail": "No ollama/ routes in litellm.config.yaml."}
         else:
-            worst = min(loaded, key=lambda m: m.get("gpu_pct") or 0)
-            pct = worst.get("gpu_pct") or 0
-            g = {"status": "good" if pct >= 100 else ("warning" if pct >= 50 else "critical"),
-                 "value": f"{pct}% VRAM",
-                 "detail": f"{worst['name']} is {'fully on the 2060' if pct >= 100 else 'partly on CPU: check the CUDA-on-WSL driver or model size'}."}
-        out.append({"id": "gpu", "label": "Local models on GPU", **g})
+            parts, worst = [], "good"
+            rank = {"good": 0, "warning": 1, "critical": 2}
+            for route, model in local.items():
+                m = loaded.get(model)
+                if not m:
+                    st, txt = "warning", f"{route} ({model}) not resident: evicted or Ollama restarted (keep_alive should hold it)"
+                elif _cpu_by_design(model):
+                    st, txt = "good", f"{route} on CPU by design"
+                elif (m.get("gpu_pct") or 0) == 0:
+                    st, txt = "critical", f"{route} ({model}) fully on CPU: CUDA-on-WSL driver missing?"
+                elif m["gpu_pct"] < 50:
+                    st, txt = "warning", f"{route} only {m['gpu_pct']}% in VRAM: slow; another model may be crowding the 6 GB card"
+                else:
+                    st, txt = "good", f"{route} {m['gpu_pct']}% in VRAM" + (" (partial offload expected on 6 GB)" if m["gpu_pct"] < 100 else "")
+                parts.append(txt)
+                worst = st if rank[st] > rank[worst] else worst
+            gpu = [loaded[m]["gpu_pct"] for r, m in local.items() if m in loaded and not _cpu_by_design(m)]
+            g = {"status": worst, "value": f"{min(gpu)}% VRAM" if gpu else f"{len(loaded)} resident",
+                 "detail": "; ".join(parts) + "."}
+        out.append({"id": "gpu", "label": "Local models resident", **g})
 
         lf = (by.get("langfuse") or {}).get("detail") or {}
         if lf.get("api_error") or not by.get("langfuse", {}).get("ok"):
@@ -936,6 +960,8 @@ class Backend:
             raise ValueError("empty query")
         if ";" in q:
             raise ValueError("one statement at a time (no ';')")
+        if q.split(None, 1)[0].lower() not in ("select", "with", "table", "values", "explain", "show"):
+            raise ValueError("read-only console: start with SELECT, WITH, TABLE, VALUES, EXPLAIN or SHOW")
         if not self.db_url:
             raise ValueError("DASHBOARD_DATABASE_URL not set")
         t0 = time.perf_counter()
