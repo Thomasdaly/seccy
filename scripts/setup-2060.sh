@@ -90,5 +90,17 @@ curl -s -m 120 "http://$IP:4000/v1/chat/completions" \
   | head -c 400 || fail=1
 echo
 
+# Also loads bge-m3-cpu: OLLAMA_KEEP_ALIVE=-1 pins a model once loaded but
+# doesn't preload it, so without this embed stays cold after every restart.
+step "embed route: litellm -> ollama (warm-up)"
+if curl -s -m 120 "http://$IP:4000/v1/embeddings" \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"embed","input":"warm-up"}' | grep -q '"embedding"'; then
+  echo "embed: ok"
+else
+  echo "embed: FAILED"; fail=1
+fi
+OLLAMA_HOST=$OLLAMA_ADDR ollama ps
+
 docker compose ps
 [ "$fail" = 0 ] && echo "ALL OK" || { echo "SOME CHECKS FAILED — see: docker compose logs --tail 30 <service>"; exit 1; }
