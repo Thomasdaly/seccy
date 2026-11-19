@@ -51,9 +51,12 @@ step "compose"
 cd "$REPO"
 [ -f .env ] || { echo "missing $REPO/.env (copy .env.example and fill it)"; exit 1; }
 docker compose pull
+docker compose up -d --wait postgres
+docker compose exec -T postgres psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='langfuse'" | grep -q 1 \
+  || docker compose exec -T postgres createdb -U postgres langfuse
 docker compose up -d --remove-orphans
 
-step "health (waiting up to 3 min for langfuse migrations)"
+step "health (waiting up to 3 min for langfuse + clickhouse migrations)"
 IP=$(tailscale ip -4)
 KEY=$(grep '^LITELLM_MASTER_KEY=' .env | cut -d= -f2-)
 wait_for() { # name url

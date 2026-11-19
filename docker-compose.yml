@@ -1,13 +1,51 @@
-# Services runner (2060 / WSL2). Ports bind to TAILNET_IP only, so nothing is
-# exposed on the LAN (WSL mirrored networking would otherwise publish to it).
-# Needs tailscale0 up before Docker starts; see README.
+# Services runner (2060 / WSL2). Published ports bind to TAILNET_IP only, so
+# nothing is exposed on the LAN (WSL mirrored networking would otherwise publish
+# to it). Langfuse's backing stores (ClickHouse, Redis, MinIO) are not published
+# at all. Needs tailscale0 up before Docker starts; see README.
+#
+# Images are pinned. To upgrade, bump the tag, `docker compose pull`, re-test.
 x-common: &common
   restart: unless-stopped
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/langfuse
+  NEXTAUTH_URL: http://${TAILNET_IP:-127.0.0.1}:3000
+  SALT: ${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
+  ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY in .env}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_AUTH:?set REDIS_AUTH in .env}
+
+x-langfuse-depends: &langfuse-depends
+  postgres: { condition: service_healthy }
+  clickhouse: { condition: service_healthy }
+  redis: { condition: service_healthy }
+  minio: { condition: service_healthy }
 
 services:
   litellm:
     <<: *common
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:v1.110.1
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     volumes: ["./litellm.config.yaml:/app/config.yaml:ro"]
     ports: ["${TAILNET_IP:-127.0.0.1}:4000:4000"]
@@ -16,7 +54,7 @@ services:
 
   qdrant:
     <<: *common
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.20.2
     ports: ["${TAILNET_IP:-127.0.0.1}:6333:6333"]
     volumes: ["qdrant_data:/qdrant/storage"]
 
@@ -33,19 +71,15 @@ services:
       timeout: 3s
       retries: 10
 
-  # Pinned to v2: v3 additionally needs ClickHouse, Redis and S3/MinIO.
+  # --- Langfuse v4 (web + worker + ClickHouse/Redis/MinIO) -------------------
   langfuse:
     <<: *common
-    image: langfuse/langfuse:2
-    depends_on:
-      postgres: { condition: service_healthy }
+    image: langfuse/langfuse:4.79.0
+    depends_on: *langfuse-depends
     ports: ["${TAILNET_IP:-127.0.0.1}:3000:3000"]
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
-      NEXTAUTH_URL: http://${TAILNET_IP:-127.0.0.1}:3000
+      <<: *langfuse-env
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET in .env}
-      SALT: ${LANGFUSE_SALT:?set LANGFUSE_SALT in .env}
-      TELEMETRY_ENABLED: "false"
       AUTH_DISABLE_SIGNUP: "true"
       # Headless init: creates org/project/user and the API keys LiteLLM logs with
       LANGFUSE_INIT_ORG_ID: harness
@@ -58,6 +92,60 @@ services:
       LANGFUSE_INIT_USER_NAME: admin
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?set LANGFUSE_INIT_USER_PASSWORD in .env}
 
+  langfuse-worker:
+    <<: *common
+    image: langfuse/langfuse-worker:4.79.0
+    depends_on: *langfuse-depends
+    environment: *langfuse-env
+
+  clickhouse:
+    <<: *common
+    image: clickhouse/clickhouse-server:26.3.62.3
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    <<: *common
+    image: redis:7.4
+    command: ["--requirepass", "${REDIS_AUTH}", "--maxmemory-policy", "noeviction"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_AUTH}", "--no-auth-warning", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  minio:
+    <<: *common
+    # Chainguard only publishes :latest for free, so pin by digest
+    image: cgr.dev/chainguard/minio@sha256:16b824a0016ffad3dfa8b059755f83800aa42ca68fe86f1782cabd0c5a16d322
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes: ["minio_data:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
 volumes:
   pgdata:
   qdrant_data:
+  clickhouse_data:
+  clickhouse_logs:
+  redis_data:
+  minio_data:
