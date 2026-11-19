@@ -10,6 +10,6 @@ model_list:
   # Tier 2 — frontier, hard steps only
   - model_name: judge
     litellm_params: { model: anthropic/claude-<current> }
-# Enable once LANGFUSE_PUBLIC_KEY/SECRET_KEY are set in .env (create a project in the Langfuse UI)
-# litellm_settings:
-#   success_callback: ["langfuse"]     # every call → cost + trace
+litellm_settings:                    # keys: LANGFUSE_PUBLIC_KEY/SECRET_KEY/HOST in .env
+  success_callback: ["langfuse"]     # every call → cost + trace
+  failure_callback: ["langfuse"]
