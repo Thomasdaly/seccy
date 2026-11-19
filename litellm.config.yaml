@@ -9,7 +9,7 @@ model_list:
     litellm_params: { model: openrouter/z-ai/glm-4.6 }
   # Tier 2 — frontier, hard steps only
   - model_name: judge
-    litellm_params: { model: anthropic/claude-<current> }
+    litellm_params: { model: anthropic/claude-fable-5-2 }   # rare by design: final verdicts + stalled runs
 litellm_settings:                    # keys: LANGFUSE_PUBLIC_KEY/SECRET_KEY/HOST in .env
   success_callback: ["langfuse"]     # every call → cost + trace
   failure_callback: ["langfuse"]

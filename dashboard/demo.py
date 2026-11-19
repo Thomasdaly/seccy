@@ -17,7 +17,7 @@ TARGETS = [("juice-shop.lab", "lab"), ("crapi.lab", "lab"), ("vampi.lab", "lab")
 PATHS = ["/api/Users/{id}", "/api/BasketItems/{id}", "/rest/basket/{id}", "/identity/api/v2/vehicle/{id}/location",
          "/workshop/api/shop/orders/{id}", "/users/v1/{username}", "/books/v1/{title}", "/tenants/{tid}/invoices/{id}",
          "/tenants/{tid}/members", "/api/Feedbacks/{id}", "/community/api/v2/community/posts/{id}", "/api/Cards/{id}"]
-MODELS = {"glue": "qwen3:8b", "embed": "bge-m3-cpu", "planner": "z-ai/glm-4.6", "judge": "claude-sonnet-5-5"}
+MODELS = {"glue": "qwen3:8b", "embed": "bge-m3-cpu", "planner": "z-ai/glm-4.6", "judge": "claude-fable-5-2"}
 STEPS = {"glue": "observe", "embed": "dedup_embed", "planner": "plan_probes", "judge": "judge_finding"}
 
 
@@ -47,7 +47,7 @@ class DemoBackend(Backend):
         super().__init__()
         if not self.routes:
             self.routes = {"glue": "ollama/qwen3:8b", "embed": "ollama/bge-m3-cpu",
-                           "planner": "openrouter/z-ai/glm-4.6", "judge": "anthropic/claude-<current>"}
+                           "planner": "openrouter/z-ai/glm-4.6", "judge": "anthropic/claude-fable-5-2"}
         self._build(random.Random(7))
         self._fake_history(random.Random(11))
 
@@ -291,8 +291,7 @@ class DemoBackend(Backend):
             {"route": "glue", "model": "ollama/qwen3:8b", "ok": True, "error": None},
             {"route": "embed", "model": "ollama/bge-m3", "ok": True, "error": None},
             {"route": "planner", "model": "openrouter/z-ai/glm-4.6", "ok": True, "error": None},
-            {"route": "judge", "model": "anthropic/claude-<current>", "ok": False,
-             "error": "litellm.NotFoundError: AnthropicException - model: claude-<current> not found"}]}
+            {"route": "judge", "model": "anthropic/claude-fable-5-2", "ok": True, "error": None}]}
 
     # ---- raw -----------------------------------------------------------------
 

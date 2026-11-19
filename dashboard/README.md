@@ -30,7 +30,7 @@ Each view answers one question, and each metric ties back to a principle in
 | **Raw** | What's behind the numbers? | Langfuse generations and root traces (cursor-paged `v2/observations`), every harness table, Qdrant points, and a read-only SQL console. |
 
 The **Stack checks** panel turns those principles into pass/fail checks:
-services reachable, routes concrete (it flags `judge: anthropic/claude-<current>`),
+services reachable, routes concrete (it flags placeholder models like `claude-<current>`),
 local models resident, tracing flowing, judge ≤10% of calls, no confirmed verdict
 without evidence, scope denials, kill switch, disk.
 
