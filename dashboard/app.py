@@ -72,14 +72,19 @@ async def basic_auth(request: Request, call_next):
     return resp
 
 
-@app.exception_handler(Exception)
-async def upstream_error(_: Request, e: Exception):
-    if isinstance(e, ValueError):
-        return JSONResponse({"error": str(e)}, status_code=400)
-    if isinstance(e, (httpx.HTTPError, psycopg.Error, OSError, RuntimeError, KeyError)):
-        return JSONResponse({"error": f"{type(e).__name__}: {str(e).strip()[:300]}"}, status_code=502)
-    log.exception("unhandled")
-    return JSONResponse({"error": f"{type(e).__name__}: {e}"[:300]}, status_code=500)
+def _err(status: int):
+    async def handler(_: Request, e: Exception):
+        msg = str(e).strip().split("\n")[0][:300]
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401:
+            msg = f"{e.request.url.host} rejected the credentials (401). Check LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY."
+        return JSONResponse({"error": msg if status == 400 else f"{type(e).__name__}: {msg}"}, status_code=status)
+    return handler
+
+
+# Expected upstream failures become JSON errors the UI shows inline (no traceback spam).
+app.add_exception_handler(ValueError, _err(400))
+for exc in (httpx.HTTPError, psycopg.Error, OSError, RuntimeError, KeyError, asyncio.TimeoutError):
+    app.add_exception_handler(exc, _err(502))
 
 
 Range = Query("7d", pattern="^(" + "|".join(RANGES) + ")$")
@@ -116,13 +121,13 @@ async def probe_routes():
 
 
 @app.get("/api/raw/generations")
-async def raw_generations(range: str = Range, page: int = Query(1, ge=1, le=10000)):  # noqa: A002
-    return await backend.raw_generations(range, page)
+async def raw_generations(range: str = Range, cursor: str | None = Query(None, max_length=4096)):  # noqa: A002
+    return await backend.raw_generations(range, cursor)
 
 
 @app.get("/api/raw/traces")
-async def raw_traces(range: str = Range, page: int = Query(1, ge=1, le=10000)):  # noqa: A002
-    return await backend.raw_traces(range, page)
+async def raw_traces(range: str = Range, cursor: str | None = Query(None, max_length=4096)):  # noqa: A002
+    return await backend.raw_traces(range, cursor)
 
 
 @app.get("/api/raw/tables")

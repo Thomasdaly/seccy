@@ -1,9 +1,9 @@
 model_list:
   # Tier 0 — local, free, high-volume glue
   - model_name: glue
-    litellm_params: { model: ollama/qwen3:8b, api_base: http://host.docker.internal:11434, think: false, keep_alive: -1 }   # no reasoning tokens; stay loaded
+    litellm_params: { model: ollama/qwen3:8b, api_base: http://host.docker.internal:11434, think: false, keep_alive: "-1m" }   # no reasoning tokens; stay loaded
   - model_name: embed
-    litellm_params: { model: ollama/bge-m3-cpu, api_base: http://host.docker.internal:11434, keep_alive: -1 }   # CPU-only copy: keeps the 6 GB GPU for qwen3
+    litellm_params: { model: ollama/bge-m3-cpu, api_base: http://host.docker.internal:11434, keep_alive: "-1m" }   # CPU-only copy: keeps the 6 GB GPU for qwen3
   # Tier 1 — hosted open, cheap reasoning (~1/6 frontier cost)
   - model_name: planner
     litellm_params: { model: openrouter/z-ai/glm-4.6 }

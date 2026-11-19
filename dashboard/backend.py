@@ -1,13 +1,15 @@
 """Data access + aggregation for the harness dashboard.
 
 Every upstream is read-only: LiteLLM (routes, liveness), Ollama (models, VRAM),
-Qdrant (collections), Langfuse public API (generations, traces, daily metrics)
-and Postgres as the `dashboard_ro` role (harness schema, see db/harness.sql).
+Qdrant (collections), Langfuse v4 public API (v2 metrics for exact aggregates,
+v2 observations for raw rows), Langfuse's backing stores (liveness only) and
+Postgres as the `dashboard_ro` role (harness schema, see db/harness.sql).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -44,6 +46,12 @@ HARNESS_TABLES = {  # table -> column to sort newest-first by
     "verdicts": "id",
     "guardrail_events": "ts",
 }
+GENERATION_TYPES = ["GENERATION", "EMBEDDING"]
+GEN_FILTER = [{"column": "type", "operator": "any of", "value": GENERATION_TYPES, "type": "stringOptions"}]
+ERROR_FILTER = [{"column": "level", "operator": "=", "value": "ERROR", "type": "string"}]
+USAGE_METRICS = [("count", "count"), ("totalTokens", "sum"), ("totalCost", "sum"), ("latency", "p50"), ("latency", "p95")]
+GRANULARITY = {3600: "hour", 86400: "day", 7 * 86400: "week"}
+PIPELINE = ["langfuse-worker", "clickhouse", "redis", "minio"]  # Langfuse v4 backing services
 HISTORY_SAMPLES = 2880  # 24h at 30s
 POLL_SECONDS = 30
 
@@ -61,9 +69,31 @@ def parse_ts(v: Any) -> float | None:
     if isinstance(v, (int, float)):
         return float(v)
     try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except ValueError:
         return None
+    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def num(v: Any) -> float:
+    """Langfuse metrics can return numbers as strings (ClickHouse decimals)."""
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def err_text(e: Exception) -> str:
+    """Short upstream error: status + path, never the full URL with query strings."""
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code
+        hint = " (check Langfuse API keys)" if code == 401 else ""
+        return f"HTTP {code} from {e.request.url.path}{hint}"
+    return f"{type(e).__name__}: {str(e).strip().splitlines()[0][:160] if str(e).strip() else ''}"
+
+
+def opt_num(v: Any) -> float | None:
+    return None if v is None or v == "" else num(v)
 
 
 def iso(t: float) -> str:
@@ -82,7 +112,9 @@ def percentile(vals: list[float], q: float) -> float | None:
 def make_buckets(rng: str, now: float | None = None) -> tuple[list[float], int]:
     span, step = RANGES[rng]
     now = time.time() if now is None else now
-    end = (math.floor(now / step) + 1) * step
+    # weekly buckets start Monday 00:00 UTC (epoch day 0 was a Thursday) to match Langfuse
+    offset = 4 * 86400 if step == 7 * 86400 else 0
+    end = (math.floor((now - offset) / step) + 1) * step + offset
     n = span // step
     return [end - (n - i) * step for i in range(n)], step
 
@@ -111,6 +143,11 @@ def preview(v: Any, n: int = 160) -> str:
     """One-line preview of a chat input/output for table cells."""
     if v is None:
         return ""
+    if isinstance(v, str) and v[:1] in "[{":
+        try:  # v2 observations return input/output as raw JSON strings
+            v = json.loads(v)
+        except ValueError:
+            pass
     if isinstance(v, dict):
         if "messages" in v:
             v = v["messages"]
@@ -234,8 +271,8 @@ class Backend:
         self.qdrant = _env("QDRANT_URL", "http://qdrant:6333").rstrip("/")
         self.ollama = _env("OLLAMA_URL", "http://host.docker.internal:11434").rstrip("/")
         self.db_url = _env("DASHBOARD_DATABASE_URL")
-        self.obs_cap = int(_env("DASHBOARD_OBS_CAP", "5000"))
-        self.trace_cap = int(_env("DASHBOARD_TRACE_CAP", "5000"))
+        # Langfuse v4 pipeline: only probed when configured (they're unpublished, compose-network only)
+        self.extra_probes = {k: _env(f"PROBE_{k.upper().replace('-', '_')}") for k in PIPELINE}
         self.http = httpx.AsyncClient(timeout=10)
         self.routes: dict[str, str] = load_config_routes(_env("LITELLM_CONFIG", "litellm.config.yaml"))
         self.cache = TTLCache()
@@ -301,8 +338,9 @@ class Backend:
         d: dict = {}
         try:
             rd = (await self.http.get(f"{self.litellm}/health/readiness")).json()
-            cbs = rd.get("success_callbacks") or []
-            d = {"version": rd.get("litellm_version"), "langfuse_callback": any("langfuse" in str(c).lower() for c in cbs)}
+            d = {"version": rd.get("litellm_version")}
+            if "success_callbacks" in rd:  # only some LiteLLM builds report callbacks here
+                d["langfuse_callback"] = any("langfuse" in str(c).lower() for c in rd["success_callbacks"] or [])
         except (httpx.HTTPError, ValueError):
             pass
         try:
@@ -358,14 +396,39 @@ class Backend:
         if not self.lf_ready:
             d["api_error"] = "LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set"
             return d
+        now = time.time()
         try:
-            j = await self.lf_get("/api/public/traces", limit=1, page=1)
+            j = await self.lf_get("/api/public/v2/observations", fromStartTime=iso(now - 30 * 86400),
+                                  toStartTime=iso(now + 60), limit=1, fields="core")
             data = j.get("data") or []
-            d["last_trace_at"] = parse_ts(data[0].get("timestamp")) if data else None
-            d["traces_total"] = (j.get("meta") or {}).get("totalItems")
+            d["last_obs_at"] = parse_ts(data[0].get("startTime")) if data else None
+            rows = await self.lf_metrics(now - 86400, now, [], [("count", "count"), ("totalCost", "sum")])
+            d["gens_24h"] = int(num(rows[0].get("count_count"))) if rows else 0
+            d["cost_24h"] = num(rows[0].get("sum_totalCost")) if rows else 0.0
         except (httpx.HTTPError, ValueError) as e:
-            d["api_error"] = str(e)[:200]
+            d["api_error"] = err_text(e)
         return d
+
+    async def _pipeline(self, name: str) -> dict:
+        """Liveness of Langfuse v4's worker and stores. No credentials needed."""
+        target = self.extra_probes[name]
+        if name == "redis":
+            host, _, port = target.rpartition(":")
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, int(port)), 5)
+            try:
+                writer.write(b"PING\r\n")
+                await writer.drain()
+                line = (await asyncio.wait_for(reader.readline(), 5)).decode(errors="replace").strip()
+            finally:
+                writer.close()
+            if not (line == "+PONG" or line.startswith("-NOAUTH")):  # NOAUTH still proves a live server
+                raise RuntimeError(f"unexpected reply {line[:40]!r}")
+            return {"reply": "PONG" if line == "+PONG" else "auth required (alive)"}
+        path = {"clickhouse": "/ping", "minio": "/minio/health/live", "langfuse-worker": "/api/health"}[name]
+        r = await self.http.get(target.rstrip("/") + path, timeout=5)
+        if r.status_code >= 500:
+            r.raise_for_status()
+        return {"http": r.status_code}
 
     async def _postgres(self) -> dict:
         if not self.db_url:
@@ -383,6 +446,9 @@ class Backend:
     async def poll_once(self) -> None:
         checks = {"litellm": self._litellm, "ollama": self._ollama, "qdrant": self._qdrant,
                   "langfuse": self._langfuse, "postgres": self._postgres}
+        for name, target in self.extra_probes.items():
+            if target:
+                checks[name] = (lambda n=name: self._pipeline(n))
         results = await asyncio.gather(*(probe(n, f) for n, f in checks.items()))
         now = time.time()
         for r in results:
@@ -457,7 +523,7 @@ class Backend:
         out.append({"id": "reachable", "label": "All services reachable",
                     "status": "critical" if down else "good",
                     "value": f"{len(services) - len(down)}/{len(services)} up",
-                    "detail": ("Down: " + ", ".join(down)) if down else "LiteLLM, Ollama, Qdrant, Langfuse and Postgres answered the last probe."})
+                    "detail": ("Down: " + ", ".join(down)) if down else "Every service answered the last probe."})
 
         bad = [r["route"] for r in self.route_table() if r["placeholder"]]
         out.append({"id": "routes", "label": "Model routes configured",
@@ -483,12 +549,14 @@ class Backend:
         lf = (by.get("langfuse") or {}).get("detail") or {}
         if lf.get("api_error") or not by.get("langfuse", {}).get("ok"):
             t = {"status": "warning", "value": "no API", "detail": lf.get("api_error") or "Langfuse unreachable; spend is not being recorded."}
-        elif not lf.get("last_trace_at"):
-            t = {"status": "unknown", "value": "no traces", "detail": "Nothing traced yet. Every LiteLLM call should land here."}
+        elif not lf.get("last_obs_at"):
+            t = {"status": "unknown", "value": "no traces", "detail": "Nothing traced in 30 days. Every LiteLLM call should land here over OTLP."}
         else:
-            t = {"status": "good", "value": f"{lf.get('traces_total') or 0:,} traces",
-                 "detail": "If calls run but the last-trace time stops moving, the LiteLLM to Langfuse callback is broken.",
-                 "at": lf["last_trace_at"]}
+            stalled = [n for n in ("langfuse-worker", "clickhouse") if n in by and not by[n]["ok"]]
+            t = {"status": "warning" if stalled else "good", "value": f"{lf.get('gens_24h', 0):,} calls / 24h",
+                 "detail": (f"{' and '.join(stalled)} down: new traces are queued but not processed. " if stalled else "")
+                 + "If calls run but the last-trace time stops moving, LiteLLM's OTLP export or the Langfuse worker is broken.",
+                 "at": lf["last_obs_at"]}
         out.append({"id": "tracing", "label": "Tracing flowing", **t})
 
         try:
@@ -496,7 +564,11 @@ class Backend:
             split = fl["split"]
             calls = sum(v["calls"] for v in split.values())
             cost = sum(v["cost"] for v in split.values())
-            if calls:
+            lf_down = [n for n in fl["notes"] if "unavailable" in n]
+            if lf_down:
+                out.append({"id": "tiers", "label": "Tier discipline (7d)", "status": "unknown", "value": "no data",
+                            "detail": lf_down[0]})
+            elif calls:
                 judge_c = split.get("judge", {}).get("calls", 0) / calls
                 glue_c = (split.get("glue", {}).get("calls", 0) + split.get("embed", {}).get("calls", 0)) / calls
                 judge_s = (split.get("judge", {}).get("cost", 0) / cost) if cost else 0
@@ -559,74 +631,82 @@ class Backend:
         r.raise_for_status()
         return r.json()
 
-    async def lf_paged(self, path: str, params: dict, cap: int) -> tuple[list[dict], int]:
-        first = await self.lf_get(path, **params, page=1, limit=100)
-        out = list(first.get("data") or [])
-        meta = first.get("meta") or {}
-        total = meta.get("totalItems") or len(out)
-        pages = min(meta.get("totalPages") or 1, math.ceil(cap / 100))
-        sem = asyncio.Semaphore(4)
+    async def lf_metrics(self, since: float, until: float, dims: list[str], metrics: list[tuple[str, str]],
+                         filters: list[dict] | None = None, gran: str | None = None,
+                         order: list[dict] | None = None, limit: int = 1000) -> list[dict]:
+        """One Langfuse v2 metrics query over generations; exact, aggregated in ClickHouse."""
+        q: dict = {"view": "observations", "dimensions": [{"field": d} for d in dims],
+                   "metrics": [{"measure": m, "aggregation": a} for m, a in metrics],
+                   "filters": GEN_FILTER + (filters or []),
+                   "fromTimestamp": iso(since), "toTimestamp": iso(until), "config": {"row_limit": limit}}
+        if gran:
+            q["timeDimension"] = {"granularity": gran}
+        if order:
+            q["orderBy"] = order
+        body = json.dumps(q, sort_keys=True)
 
-        async def one(p: int) -> list[dict]:
-            async with sem:
-                return (await self.lf_get(path, **params, page=p, limit=100)).get("data") or []
-        for chunk in await asyncio.gather(*(one(p) for p in range(2, pages + 1))):
-            out.extend(chunk)
-        return out[:cap], max(total, len(out))
+        async def fetch():
+            return (await self.lf_get("/api/public/v2/metrics", query=body)).get("data") or []
+        return await self.cache.get(("metrics", body), 30, fetch)
+
+    # Each returns normalized rows; DemoBackend overrides these five.
+
+    async def usage_rows(self, since: float, until: float, gran: str | None) -> list[dict]:
+        rows = await self.lf_metrics(since, until, ["providedModelName"], USAGE_METRICS, gran=gran)
+        return [{"ts": parse_ts(r.get("time_dimension")), "route": self.route_of(r.get("providedModelName")),
+                 "calls": num(r.get("count_count")), "tokens": num(r.get("sum_totalTokens")),
+                 "cost": num(r.get("sum_totalCost")), "p50": opt_num(r.get("p50_latency")),
+                 "p95": opt_num(r.get("p95_latency"))} for r in rows]
+
+    async def error_rows(self, since: float, until: float, gran: str | None) -> list[dict]:
+        rows = await self.lf_metrics(since, until, ["providedModelName"], [("count", "count")], ERROR_FILTER, gran)
+        return [{"ts": parse_ts(r.get("time_dimension")), "route": self.route_of(r.get("providedModelName")),
+                 "errors": num(r.get("count_count"))} for r in rows]
+
+    async def step_rows(self, since: float, until: float) -> list[dict]:
+        dims = ["name", "providedModelName"]
+        rows = await self.lf_metrics(since, until, dims, USAGE_METRICS)
+        errs = {(r.get("name"), r.get("providedModelName")): num(r.get("count_count"))
+                for r in await self.lf_metrics(since, until, dims, [("count", "count")], ERROR_FILTER)}
+        return [{"name": r.get("name") or "(unnamed)", "route": self.route_of(r.get("providedModelName")),
+                 "calls": num(r.get("count_count")), "tokens": num(r.get("sum_totalTokens")),
+                 "cost": num(r.get("sum_totalCost")), "p50": opt_num(r.get("p50_latency")),
+                 "p95": opt_num(r.get("p95_latency")),
+                 "errors": errs.get((r.get("name"), r.get("providedModelName")), 0)} for r in rows]
+
+    async def session_rows(self, since: float, until: float) -> list[dict]:
+        """Top sessions by spend (sessionId is high-cardinality: top-N only, no time dimension)."""
+        rows = await self.lf_metrics(since, until, ["sessionId"], [("count", "count"), ("totalCost", "sum")],
+                                     order=[{"field": "sum_totalCost", "direction": "desc"}], limit=200)
+        return [{"session_id": r.get("sessionId"), "calls": num(r.get("count_count")), "cost": num(r.get("sum_totalCost"))}
+                for r in rows if r.get("sessionId")]
+
+    async def route_totals(self, since: float, until: float) -> list[dict]:
+        rows = await self.lf_metrics(since, until, ["providedModelName"], [("count", "count"), ("latency", "p95")])
+        return [{"route": self.route_of(r.get("providedModelName")), "calls": num(r.get("count_count")),
+                 "p95": opt_num(r.get("p95_latency"))} for r in rows]
 
     def norm_obs(self, o: dict) -> dict:
         st, et = parse_ts(o.get("startTime")), parse_ts(o.get("endTime"))
-        lat = (et - st) * 1000 if st and et else (o["latency"] * 1000 if isinstance(o.get("latency"), (int, float)) else None)
-        usage = o.get("usage") or {}
+        ud = o.get("usageDetails") or {}
         md = o.get("metadata")
+        if isinstance(md, str):
+            try:
+                md = json.loads(md)
+            except ValueError:
+                pass
         return {
             "id": o.get("id"), "trace_id": o.get("traceId"), "ts": st or 0, "name": o.get("name") or "(unnamed)",
-            "model": o.get("model") or "", "route": self.route_of(o.get("model"), md),
-            "latency_ms": lat,
-            "in_tok": usage.get("input") or o.get("promptTokens") or 0,
-            "out_tok": usage.get("output") or o.get("completionTokens") or 0,
-            "cost": o.get("calculatedTotalCost") or o.get("totalCost") or (o.get("costDetails") or {}).get("total") or 0,
+            "type": o.get("type"), "model": o.get("model") or "", "route": self.route_of(o.get("model"), md),
+            "session_id": o.get("sessionId"),
+            "latency_ms": (et - st) * 1000 if st and et else None,
+            "in_tok": num(o.get("inputUsage") or ud.get("input")),
+            "out_tok": num(o.get("outputUsage") or ud.get("output")),
+            "cost": num(o.get("totalCost") or (o.get("costDetails") or {}).get("total")),
             "level": o.get("level") or "DEFAULT", "status": o.get("statusMessage"),
         }
 
-    async def observations(self, since: float) -> tuple[list[dict], int]:
-        async def fetch():
-            raw, total = await self.lf_paged("/api/public/observations",
-                                             {"type": "GENERATION", "fromStartTime": iso(since)}, self.obs_cap)
-            return [self.norm_obs(o) for o in raw], total
-        return await self.cache.get(("obs", since), 60, fetch)
-
-    async def traces(self, since: float) -> tuple[list[dict], int]:
-        async def fetch():
-            raw, total = await self.lf_paged("/api/public/traces", {"fromTimestamp": iso(since)}, self.trace_cap)
-            return [{
-                "id": t.get("id"), "ts": parse_ts(t.get("timestamp")) or 0, "name": t.get("name") or "(unnamed)",
-                "session_id": t.get("sessionId"), "cost": t.get("totalCost") or 0,
-                "latency_ms": (t["latency"] * 1000) if isinstance(t.get("latency"), (int, float)) else None,
-            } for t in raw], total
-        return await self.cache.get(("traces", since), 60, fetch)
-
-    async def daily(self, since: float) -> list[dict]:
-        """Exact per-day, per-model usage from Langfuse (not capped like the samples)."""
-        async def fetch():
-            raw, _ = await self.lf_paged("/api/public/metrics/daily", {"fromTimestamp": iso(since)}, 200)
-            rows = []
-            for d in raw:
-                t = parse_ts(str(d.get("date"))[:10] + "T00:00:00Z")
-                if t is None:
-                    continue
-                usage = d.get("usage") or []
-                for u in usage:
-                    rows.append({"ts": t, "route": self.route_of(u.get("model")),
-                                 "calls": u.get("countObservations") or 0,
-                                 "tokens": u.get("totalUsage") or 0, "cost": u.get("totalCost") or 0})
-                if not usage and d.get("totalCost"):
-                    rows.append({"ts": t, "route": "other", "calls": d.get("countObservations") or 0,
-                                 "tokens": 0, "cost": d.get("totalCost") or 0})
-            return rows
-        return await self.cache.get(("daily", since), 60, fetch)
-
-    # ---- harness DB ----------------------------------------------------------
+        # ---- harness DB ----------------------------------------------------------
 
     async def _db(self):
         return await psycopg.AsyncConnection.connect(self.db_url, connect_timeout=5, row_factory=dict_row)
@@ -667,57 +747,42 @@ class Backend:
     async def trends(self, rng: str) -> dict:
         async def build():
             starts, step = make_buckets(rng)
-            since, n = starts[0], len(starts)
+            since, n, now = starts[0], len(starts), time.time()
+            gran = GRANULARITY[step]
             order = self.route_order()
             notes: list[str] = []
 
-            def idx(t: float) -> int | None:
+            def idx(t: float | None) -> int | None:
+                if t is None:
+                    return None
                 i = int((t - since) // step)
                 return i if 0 <= i < n else None
 
-            def zero():
-                return {r: [0.0] * n for r in order}
+            def zero(fill=0.0):
+                return {r: [fill] * n for r in order}
             calls, tokens, cost, errors = zero(), zero(), zero(), zero()
-            lat: dict[str, list[list[float]]] = {r: [[] for _ in range(n)] for r in order}
-            lat_all: dict[str, list[float]] = defaultdict(list)
-            sample_calls = sample_errors = 0
-            obs: list[dict] = []
+            p50, p95 = zero(None), zero(None)
+            totals_p95: dict[str, float | None] = {}
             try:
-                obs, total = await self.observations(since)
-                if len(obs) < total:
-                    notes.append(f"Latency and error figures use the latest {len(obs):,} of {total:,} generations.")
+                for u in await self.usage_rows(since, now, gran):
+                    i, r = idx(u["ts"]), u["route"] if u["route"] in calls else "other"
+                    if i is None:
+                        continue
+                    calls[r][i] += u["calls"]
+                    tokens[r][i] += u["tokens"]
+                    cost[r][i] += u["cost"]
+                    for agg, key in ((p50, "p50"), (p95, "p95")):  # several models on one route: keep the slowest
+                        if u[key] is not None:
+                            agg[r][i] = max(agg[r][i] or 0, u[key])
+                for e in await self.error_rows(since, now, gran):
+                    i, r = idx(e["ts"]), e["route"] if e["route"] in errors else "other"
+                    if i is not None:
+                        errors[r][i] += e["errors"]
+                for rt in await self.route_totals(since, now):
+                    if rt["p95"] is not None:
+                        totals_p95[rt["route"]] = max(totals_p95.get(rt["route"]) or 0, rt["p95"])
             except Exception as e:  # noqa: BLE001
-                notes.append(f"Langfuse generations unavailable: {str(e)[:160]}")
-            for o in obs:
-                i = idx(o["ts"])
-                if i is None:
-                    continue
-                r = o["route"] if o["route"] in calls else "other"
-                calls[r][i] += 1
-                tokens[r][i] += o["in_tok"] + o["out_tok"]
-                cost[r][i] += o["cost"]
-                sample_calls += 1
-                if o["level"] == "ERROR":
-                    errors[r][i] += 1
-                    sample_errors += 1
-                if o["latency_ms"] is not None:
-                    lat[r][i].append(o["latency_ms"])
-                    lat_all[r].append(o["latency_ms"])
-            if step >= 86400:
-                try:
-                    daily = await self.daily(since)
-                    if daily:
-                        calls, tokens, cost = zero(), zero(), zero()
-                        for d in daily:
-                            i = idx(d["ts"])
-                            if i is None:
-                                continue
-                            r = d["route"] if d["route"] in calls else "other"
-                            calls[r][i] += d["calls"]
-                            tokens[r][i] += d["tokens"]
-                            cost[r][i] += d["cost"]
-                except Exception as e:  # noqa: BLE001
-                    notes.append(f"Langfuse daily metrics unavailable, using samples: {str(e)[:120]}")
+                notes.append(f"Langfuse metrics unavailable: {err_text(e)}")
 
             h = await self.harness(since)
             findings = [0] * n
@@ -725,22 +790,15 @@ class Backend:
                 i = idx(t)
                 if i is not None:
                     findings[i] += 1
-
-            total_cost = sum(sum(v) for v in cost.values())
-            n_find = sum(findings)
+            tot = lambda m: sum(sum(v) for v in m.values())  # noqa: E731
+            n_calls, n_err, total_cost, n_find = tot(calls), tot(errors), tot(cost), sum(findings)
             return {
                 "range": rng, "step": step, "buckets": starts, "routes": order,
-                "calls": calls, "tokens": tokens, "cost": cost, "errors": errors,
-                "p50": {r: [percentile(b, .5) for b in lat[r]] for r in order},
-                "p95": {r: [percentile(b, .95) for b in lat[r]] for r in order},
+                "calls": calls, "tokens": tokens, "cost": cost, "errors": errors, "p50": p50, "p95": p95,
                 "findings": findings, "harness": h.get("available", False),
                 "totals": {
-                    "calls": sum(sum(v) for v in calls.values()),
-                    "tokens": sum(sum(v) for v in tokens.values()),
-                    "cost": total_cost,
-                    "error_rate": (sample_errors / sample_calls) if sample_calls else None,
-                    "errors": sample_errors,
-                    "p95": {r: percentile(v, .95) for r, v in lat_all.items()},
+                    "calls": n_calls, "tokens": tot(tokens), "cost": total_cost, "errors": n_err,
+                    "error_rate": (n_err / n_calls) if n_calls else None, "p95": totals_p95,
                     "findings": n_find if h.get("available") else None,
                     "cost_per_finding": (total_cost / n_find) if n_find else None,
                 },
@@ -751,106 +809,86 @@ class Backend:
     async def flows(self, rng: str) -> dict:
         async def build():
             tr = await self.trends(rng)
-            since = tr["buckets"][0]
+            since, now = tr["buckets"][0], time.time()
             notes = list(tr["notes"])
             split = {r: {"calls": sum(tr["calls"][r]), "tokens": sum(tr["tokens"][r]), "cost": sum(tr["cost"][r])}
                      for r in tr["routes"]}
 
             steps: dict[str, dict] = {}
-            try:
-                obs, _ = await self.observations(since)
-            except Exception:  # noqa: BLE001 - already noted by trends
-                obs = []
-            lats: dict[str, list[float]] = defaultdict(list)
-            for o in obs:
-                s = steps.setdefault(o["name"], {"name": o["name"], "calls": 0, "cost": 0.0, "tokens": 0, "errors": 0, "routes": Counter()})
-                s["calls"] += 1
-                s["cost"] += o["cost"]
-                s["tokens"] += o["in_tok"] + o["out_tok"]
-                s["errors"] += o["level"] == "ERROR"
-                s["routes"][o["route"]] += 1
-                if o["latency_ms"] is not None:
-                    lats[o["name"]].append(o["latency_ms"])
-            step_rows = []
-            for name, s in steps.items():
-                step_rows.append({**s, "route": s["routes"].most_common(1)[0][0], "routes": dict(s["routes"]),
-                                  "p50": percentile(lats[name], .5), "p95": percentile(lats[name], .95)})
+            sessions: dict[str, dict] = {}
+            if not notes:
+                try:
+                    for s in await self.step_rows(since, now):
+                        a = steps.setdefault(s["name"], {"name": s["name"], "calls": 0.0, "cost": 0.0, "tokens": 0.0,
+                                                         "errors": 0.0, "p50": None, "p95": None, "routes": Counter()})
+                        for k in ("calls", "cost", "tokens", "errors"):
+                            a[k] += s[k]
+                        for k in ("p50", "p95"):
+                            if s[k] is not None:
+                                a[k] = max(a[k] or 0, s[k])
+                        a["routes"][s["route"]] += s["calls"]
+                except Exception as e:  # noqa: BLE001
+                    notes.append(f"Per-step metrics unavailable: {err_text(e)}")
+                try:
+                    sessions = {s["session_id"]: s for s in await self.session_rows(since, now)}
+                except Exception as e:  # noqa: BLE001
+                    notes.append(f"Per-run spend unavailable (needs sessionId on generations): {err_text(e)}")
+            step_rows = [{**s, "route": s["routes"].most_common(1)[0][0] if s["routes"] else "other",
+                          "routes": dict(s["routes"])} for s in steps.values()]
             step_rows.sort(key=lambda s: (-s["cost"], -s["calls"]))
 
-            sessions: dict[str, dict] = {}
-            try:
-                trs, ttotal = await self.traces(since)
-                if len(trs) < ttotal:
-                    notes.append(f"Per-run spend uses the latest {len(trs):,} of {ttotal:,} traces.")
-                for t in trs:
-                    sid = t["session_id"]
-                    if not sid:
-                        continue
-                    s = sessions.setdefault(sid, {"traces": 0, "cost": 0.0, "first": t["ts"], "last": t["ts"]})
-                    s["traces"] += 1
-                    s["cost"] += t["cost"]
-                    s["first"], s["last"] = min(s["first"], t["ts"]), max(s["last"], t["ts"])
-            except Exception as e:  # noqa: BLE001
-                notes.append(f"Langfuse traces unavailable: {str(e)[:160]}")
-
             h = await self.harness(since)
-            runs = []
-            seen = set()
+            runs, seen = [], set()
             for r in h.get("runs", []) if h.get("available") else []:
                 s = sessions.get(r["id"], {})
                 seen.add(r["id"])
-                runs.append({**r, "tracked": True, "traces": s.get("traces", 0), "cost": s.get("cost", 0.0),
+                runs.append({**r, "tracked": True, "calls": s.get("calls", 0), "cost": s.get("cost", 0.0),
                              "cost_per_finding": (s.get("cost", 0) / r["findings"]) if r["findings"] else None})
-            for sid, s in sorted(sessions.items(), key=lambda kv: -kv[1]["last"]):
+            for sid, s in sessions.items():
                 if sid in seen or len(runs) >= 60:
                     continue
                 runs.append({"id": sid, "target": None, "program": None, "status": "untracked", "tracked": False,
-                             "started_at": s["first"], "ended_at": s["last"], "operations": None, "probes": None,
-                             "findings": None, "traces": s["traces"], "cost": s["cost"], "cost_per_finding": None})
-            runs.sort(key=lambda r: -(r["started_at"] or 0))
+                             "started_at": None, "ended_at": None, "operations": None, "probes": None,
+                             "findings": None, "calls": s["calls"], "cost": s["cost"], "cost_per_finding": None})
+            runs.sort(key=lambda r: (r["tracked"], r["started_at"] or 0, r["cost"]), reverse=True)
 
-            guard_series = None
+            harness = {k: v for k, v in h.items() if k != "findings_ts"}
             if h.get("available"):
-                n, step = len(tr["buckets"]), tr["step"]
-                kinds = ["scope_denied", "rate_limited", "kill_switch"]
-                guard_series = {k: [0] * n for k in kinds}
-                for t, k in h["guardrails"]["ts"]:
-                    i = int((t - since) // step)
-                    if 0 <= i < n and k in guard_series:
-                        guard_series[k][i] += 1
-            return {
-                "range": rng, "buckets": tr["buckets"], "step": tr["step"], "routes": tr["routes"],
-                "split": split, "steps": step_rows[:30], "runs": runs,
-                "harness": {k: v for k, v in h.items() if k not in ("findings_ts",)} | (
-                    {"guardrails": {**h["guardrails"], "ts": None, "series": guard_series}} if h.get("available") else {}),
-                "notes": notes,
-            }
+                harness["guardrails"] = {**h["guardrails"], "ts": None}
+            return {"range": rng, "buckets": tr["buckets"], "step": tr["step"], "routes": tr["routes"],
+                    "split": split, "steps": step_rows[:30], "runs": runs, "harness": harness, "notes": notes}
         return await self.cache.get(("flows", rng, make_buckets(rng)[0][0]), 30, build)
 
-    # ---- raw -----------------------------------------------------------------
+        # ---- raw -----------------------------------------------------------------
 
     def _lf_link(self, trace_id: str | None) -> str | None:
         return f"{self.langfuse_ui}/project/{self.lf_project}/traces/{trace_id}" if trace_id else None
 
-    async def raw_generations(self, rng: str, page: int) -> dict:
-        since = make_buckets(rng)[0][0]
-        j = await self.lf_get("/api/public/observations", type="GENERATION", fromStartTime=iso(since), page=page, limit=50)
+    async def _raw_obs(self, rng: str, cursor: str | None, fields: str, **extra) -> dict:
+        now = time.time()
+        params = {"fromStartTime": iso(make_buckets(rng)[0][0]), "toStartTime": iso(now + 60), "limit": 50, "fields": fields, **extra}
+        if cursor:
+            params["cursor"] = cursor
+        j = await self.lf_get("/api/public/v2/observations", **params)
+        return j
+
+    async def raw_generations(self, rng: str, cursor: str | None) -> dict:
+        j = await self._raw_obs(rng, cursor, "core,basic,model,usage,io,metadata", filter=json.dumps(GEN_FILTER))
         rows = [{**self.norm_obs(o), "input": preview(o.get("input")), "output": preview(o.get("output")),
                  "link": self._lf_link(o.get("traceId")), "raw": clean(o)} for o in j.get("data") or []]
-        meta = j.get("meta") or {}
-        return {"rows": rows, "page": page, "pages": meta.get("totalPages") or 1, "total": meta.get("totalItems")}
+        return {"rows": rows, "next": (j.get("meta") or {}).get("cursor"), "comment": (j.get("meta") or {}).get("comment")}
 
-    async def raw_traces(self, rng: str, page: int) -> dict:
-        since = make_buckets(rng)[0][0]
-        j = await self.lf_get("/api/public/traces", fromTimestamp=iso(since), page=page, limit=50)
-        rows = [{"id": t.get("id"), "ts": parse_ts(t.get("timestamp")), "name": t.get("name"),
-                 "session_id": t.get("sessionId"), "tags": t.get("tags") or [],
-                 "latency_ms": (t["latency"] * 1000) if isinstance(t.get("latency"), (int, float)) else None,
-                 "cost": t.get("totalCost") or 0, "observations": len(t.get("observations") or []),
-                 "input": preview(t.get("input")), "link": self._lf_link(t.get("id")), "raw": clean(t)}
-                for t in j.get("data") or []]
-        meta = j.get("meta") or {}
-        return {"rows": rows, "page": page, "pages": meta.get("totalPages") or 1, "total": meta.get("totalItems")}
+    async def raw_traces(self, rng: str, cursor: str | None) -> dict:
+        """Root observations stand in for traces (v4 has no trace list endpoint)."""
+        j = await self._raw_obs(rng, cursor, "core,basic,usage,io,trace_context", isRootObservation="true")
+        rows = []
+        for o in j.get("data") or []:
+            n = self.norm_obs(o)
+            rows.append({"id": o.get("traceId"), "ts": n["ts"], "name": o.get("traceName") or n["name"],
+                         "session_id": o.get("sessionId"), "tags": o.get("tags") or [], "type": o.get("type"),
+                         "latency_ms": n["latency_ms"], "cost": n["cost"], "input": preview(o.get("input")),
+                         "link": self._lf_link(o.get("traceId")), "raw": clean(o)})
+        return {"rows": rows, "next": (j.get("meta") or {}).get("cursor"), "comment": (j.get("meta") or {}).get("comment")}
 
     async def raw_tables(self) -> dict:
         if not self.db_url:

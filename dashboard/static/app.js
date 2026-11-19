@@ -223,8 +223,12 @@ const SVC = {
   litellm: { title: "LiteLLM", role: "Model router · :4000", kv: (d) => [["Version", d.version], ["Routes", d.routes], ["Langfuse callback", d.langfuse_callback == null ? "—" : d.langfuse_callback ? "on" : "off"]] },
   ollama: { title: "Ollama", role: "Local inference · RTX 2060", kv: (d) => [["Version", d.version], ["Installed models", d.installed?.length], ["Resident", (d.loaded || []).map((m) => `${m.name} · ${m.gpu_pct ?? "?"}% GPU`).join(", ") || "none (cold)"]] },
   qdrant: { title: "Qdrant", role: "Vectors · finding dedup · :6333", kv: (d) => [["Version", d.version], ["Collections", d.collections?.length], ["Points", d.collections ? fmtInt(d.collections.reduce((a, c) => a + (c.points || 0), 0)) : null]] },
-  langfuse: { title: "Langfuse", role: "Traces · token + USD cost · :3000", kv: (d) => [["Version", d.version], ["Traces", fmtInt(d.traces_total)], ["Last trace", d.last_trace_at ? fmtAgo(d.last_trace_at) : "—"]] },
-  postgres: { title: "Postgres", role: "Findings DB + Langfuse store · :5432", kv: (d) => [["Version", d.version], ["DB size", fmtBytes(d.size)], ["Connections", d.conns != null ? `${d.conns} / ${d.max_conns}` : null], ["Harness schema", d.harness == null ? null : d.harness ? "applied" : "missing"]] },
+  langfuse: { title: "Langfuse", role: "Traces · token + USD cost · :3000", kv: (d) => [["Version", d.version], ["Calls (24h)", fmtInt(d.gens_24h)], ["Spend (24h)", d.cost_24h == null ? null : fmtUSD(d.cost_24h)], ["Last trace", d.last_obs_at ? fmtAgo(d.last_obs_at) : "—"]] },
+  "langfuse-worker": { title: "Langfuse worker", role: "Ingestion queue → ClickHouse", kv: (d) => [["Health endpoint", d.http ? `HTTP ${d.http}` : null]] },
+  clickhouse: { title: "ClickHouse", role: "Langfuse trace store", kv: (d) => [["Ping", d.http ? `HTTP ${d.http}` : null]] },
+  redis: { title: "Redis", role: "Langfuse queue + cache", kv: (d) => [["Reply", d.reply]] },
+  minio: { title: "MinIO", role: "Langfuse event + media blobs", kv: (d) => [["Liveness", d.http ? `HTTP ${d.http}` : null]] },
+  postgres: { title: "Postgres", role: "Harness findings DB · Langfuse metadata · :5432", kv: (d) => [["Version", d.version], ["DB size", fmtBytes(d.size)], ["Connections", d.conns != null ? `${d.conns} / ${d.max_conns}` : null], ["Harness schema", d.harness == null ? null : d.harness ? "applied" : "missing"]] },
 };
 
 function kv(pairs) {
@@ -247,7 +251,8 @@ function renderHealth(d) {
       statusIcon(c.status), h("span", { class: "name" }, c.label), h("span", { class: "val" }, c.value),
       h("span", { class: "det" }, c.detail + (c.at ? ` Last trace ${fmtAgo(c.at)}.` : ""))))));
 
-  const svcCards = d.services.map((sv) => {
+  const PIPE = ["langfuse-worker", "clickhouse", "redis", "minio"];
+  const svcCard = (sv) => {
     const meta = SVC[sv.name] || { title: sv.name, role: "", kv: () => [] };
     const strip = mount(h("div", { class: "chart" }), (el) => uptimeStrip(el, sv.history, (t) => `${fmtWhen(t)} (15 min)`));
     return h("div", { class: "card svc" },
@@ -258,7 +263,9 @@ function renderHealth(d) {
       strip,
       sv.reasons?.length ? h("ul", { class: "reasons" }, sv.reasons.map((r) => h("li", {}, statusIcon(sv.status), h("span", {}, r)))) : null,
       sv.ok ? kv(meta.kv(sv.detail || {})) : null);
-  });
+  };
+  const svcCards = d.services.filter((x) => !PIPE.includes(x.name)).map(svcCard);
+  const pipeCards = d.services.filter((x) => PIPE.includes(x.name)).map(svcCard);
 
   const dk = d.disk;
   const usedPct = dk.used / dk.total;
@@ -320,6 +327,9 @@ function renderHealth(d) {
     checks,
     h("h2", { class: "section-title" }, "Services"),
     h("div", { class: "grid g-auto" }, svcCards),
+    pipeCards.length ? [h("h2", { class: "section-title" }, "Langfuse v4 pipeline"),
+      h("p", { class: "lede small" }, "LiteLLM exports over OTLP to Langfuse; the worker drains Redis into ClickHouse and MinIO. If any of these stop, calls still succeed but spend and traces go dark."),
+      h("div", { class: "grid g-auto" }, pipeCards)] : null,
     h("h2", { class: "section-title" }, "Models & stores"),
     h("div", { class: "stack" }, routesCard, h("div", { class: "grid g2" }, ollamaCard, qdrantCard)),
   ];
@@ -367,7 +377,7 @@ function renderTrends(d) {
     h("div", { class: "grid g2" },
       mk("cost", "Spend by route", "USD from Langfuse. Local routes are free; spend should sit on planner and judge.", fmtUSD),
       mk("calls", "Calls by route", "Glue should carry most of the volume.", fmtInt),
-      mk("p95", "p95 latency by route", "Per bucket, from sampled generations.", fmtMs, "lines"),
+      mk("p95", "p95 latency by route", "Per bucket, computed in ClickHouse.", fmtMs, "lines"),
       mk("errors", "Errors by route", "Generations Langfuse marked ERROR: timeouts, 429s, provider faults.", fmtInt),
       mk("tokens", "Tokens by route", "Input + output.", fmtInt),
       findings),
@@ -462,7 +472,7 @@ function renderFlows(d) {
   }
 
   const maxStepCost = Math.max(0, ...d.steps.map((x) => x.cost));
-  const stepsCard = card("Steps", "Generations grouped by name (set LiteLLM metadata generation_name per loop step). Sorted by spend.",
+  const stepsCard = card("Steps", "Generations grouped by name, exact from Langfuse metrics. Name each loop step via LiteLLM metadata generation_name. Sorted by spend.",
     table([
       { label: "Step", render: (r) => h("span", { class: "mono" }, r.name) },
       { label: "Route", render: (r) => routeKey(r.route) },
@@ -484,6 +494,7 @@ function renderFlows(d) {
       { label: "Ops", key: "operations", fmt: fmtInt, align: "r" },
       { label: "Probes", key: "probes", fmt: fmtInt, align: "r" },
       { label: "Findings", key: "findings", fmt: fmtInt, align: "r" },
+      { label: "LLM calls", key: "calls", fmt: fmtInt, align: "r" },
       { label: "LLM spend", key: "cost", fmt: fmtUSD, align: "r" },
       { label: "Per finding", key: "cost_per_finding", fmt: fmtUSD, align: "r" },
     ], d.runs, { empty: "No runs in this range.", cap: 15 }));
@@ -525,14 +536,20 @@ const ext = (url) => (url ? h("a", { href: url, target: "_blank", rel: "noopener
 
 async function renderRaw() {
   const sub = h("div", { class: "subnav", role: "toolbar", "aria-label": "Raw data source" }, RAW_TABS.map(([k, label]) =>
-    h("button", { "aria-pressed": String(state.raw === k), onclick: () => { state.raw = k; state.page = 1; writeHash(); render(); } }, label)));
+    h("button", { "aria-pressed": String(state.raw === k), onclick: () => { state.raw = k; state.page = 1; state.cursors = [null]; writeHash(); render(); } }, label)));
   const out = [h("p", { class: "lede" }, h("strong", {}, "The records behind every chart. "), "Read-only. Click a row for the full record. Long bodies are trimmed; Langfuse holds the originals."), sub];
   const range = state.range;
   const go = (p) => { state.page = p; render(); };
+  // Langfuse v2 pages by cursor: remember the cursor that opens each page
+  state.cursors = state.cursors || [null];
+  const cur = state.cursors[state.page - 1] ?? null;
+  const cq = cur ? `&cursor=${encodeURIComponent(cur)}` : "";
+  const cursorPager = (d) => { state.cursors[state.page] = d.next; return pager(state.page, null, go, d.next != null); };
+  const emptyPage = (d) => (d.next ? "No rows on this page; Langfuse pages can be sparse. Try Next." : "Nothing in this range.");
 
   if (state.raw === "generations") {
-    const d = await api(`/api/raw/generations?range=${range}&page=${state.page}`);
-    out.push(card(`Generations · ${fmtInt(d.total)} in ${RANGE_LABEL[range]}`, "Every LLM call LiteLLM logged to Langfuse, newest first.",
+    const d = await api(`/api/raw/generations?range=${range}${cq}`);
+    out.push(card(`Generations · ${RANGE_LABEL[range]}`, "Every LLM call LiteLLM exported to Langfuse, newest first, 50 per page.",
       table([
         { label: "Time", key: "ts", fmt: fmtWhen, cls: "nw" },
         { label: "Step", render: (r) => h("span", { class: "mono" }, r.name) },
@@ -546,22 +563,22 @@ async function renderRaw() {
         { label: "Input", key: "input", cls: "clip", title: (r) => r.input },
         { label: "Output", key: "output", cls: "clip", title: (r) => r.output || r.status || "" },
         { label: "", render: (r) => ext(r.link) },
-      ], d.rows, { onRow: (r) => openDrawer(`Generation ${r.id}`, r.raw), empty: "No generations in this range." }),
-      pager(d.page, d.pages, go)));
+      ], d.rows, { onRow: (r) => openDrawer(`Generation ${r.id}`, r.raw), empty: emptyPage(d) }),
+      cursorPager(d)));
   } else if (state.raw === "traces") {
-    const d = await api(`/api/raw/traces?range=${range}&page=${state.page}`);
-    out.push(card(`Traces · ${fmtInt(d.total)} in ${RANGE_LABEL[range]}`, "One per LiteLLM request unless the orchestrator groups them; session = harness run id.",
+    const d = await api(`/api/raw/traces?range=${range}${cq}`);
+    out.push(card(`Traces · ${RANGE_LABEL[range]}`, "Root observation of each trace (Langfuse v4 has no trace list). Session = harness run id.",
       table([
         { label: "Time", key: "ts", fmt: fmtWhen, cls: "nw" },
         { label: "Name", render: (r) => h("span", { class: "mono" }, r.name || "—") },
         { label: "Session", render: (r) => h("span", { class: "mono" }, r.session_id || "—") },
-        { label: "Obs", key: "observations", fmt: fmtInt, align: "r" },
+        { label: "Type", key: "type" },
         { label: "Latency", key: "latency_ms", fmt: fmtMs, align: "r" },
         { label: "Cost", key: "cost", fmt: fmtUSD, align: "r" },
         { label: "Input", key: "input", cls: "clip", title: (r) => r.input },
         { label: "", render: (r) => ext(r.link) },
-      ], d.rows, { onRow: (r) => openDrawer(`Trace ${r.id}`, r.raw), empty: "No traces in this range." }),
-      pager(d.page, d.pages, go)));
+      ], d.rows, { onRow: (r) => openDrawer(`Trace ${r.id}`, r.raw), empty: emptyPage(d) }),
+      cursorPager(d)));
   } else if (state.raw === "tables") {
     const t = await api("/api/raw/tables");
     if (!t.available) {
@@ -572,7 +589,7 @@ async function renderRaw() {
       const cols = d.columns.map((c) => ({ label: c, cls: "clip", render: (r) => { const v = r[c]; return v == null ? h("span", { class: "muted" }, "null") : typeof v === "object" ? JSON.stringify(v) : String(v); }, title: (r) => (r[c] == null ? "" : typeof r[c] === "object" ? JSON.stringify(r[c]) : String(r[c])) }));
       out.push(h("div", { class: "raw-split" },
         h("div", { class: "card" }, h("nav", { class: "list-nav", "aria-label": "Tables" }, t.tables.map((x) =>
-          h("button", { "aria-current": String(x.name === state.table), onclick: () => { state.table = x.name; state.page = 1; render(); } }, h("span", { class: "mono" }, x.name), h("span", { class: "muted num" }, fmtInt(x.rows)))))),
+          h("button", { "aria-current": String(x.name === state.table), onclick: () => { state.table = x.name; state.page = 1; state.cursors = [null]; render(); } }, h("span", { class: "mono" }, x.name), h("span", { class: "muted num" }, fmtInt(x.rows)))))),
         card(`harness.${state.table}`, "Newest first, 50 per page.",
           table(cols, d.rows, { onRow: (r) => openDrawer(`harness.${state.table}`, r), empty: "Empty table." }),
           pager(d.page, null, go, d.more))));
@@ -589,7 +606,7 @@ async function renderRaw() {
       state.qOffsets[state.page] = d.next;
       out.push(h("div", { class: "raw-split" },
         h("div", { class: "card" }, h("nav", { class: "list-nav", "aria-label": "Collections" }, c.collections.map((x) =>
-          h("button", { "aria-current": String(x.name === state.collection), onclick: () => { state.collection = x.name; state.page = 1; state.qOffsets = [null]; render(); } }, h("span", { class: "mono" }, x.name), h("span", { class: "muted num" }, fmtInt(x.points)))))),
+          h("button", { "aria-current": String(x.name === state.collection), onclick: () => { state.collection = x.name; state.page = 1; state.cursors = [null]; state.qOffsets = [null]; render(); } }, h("span", { class: "mono" }, x.name), h("span", { class: "muted num" }, fmtInt(x.points)))))),
         card(state.collection, "Payloads only; vectors omitted.",
           table([
             { label: "Point id", render: (r) => h("span", { class: "mono" }, String(r.id)) },
@@ -670,10 +687,10 @@ async function init() {
   } catch { /* render() will surface the error */ }
   const seg = $("#range");
   for (const r of ["24h", "7d", "30d", "90d"]) {
-    seg.append(h("button", { role: "radio", "data-range": r, onclick: () => { state.range = r; state.page = 1; state.qOffsets = [null]; writeHash(); render(); } }, r));
+    seg.append(h("button", { role: "radio", "data-range": r, onclick: () => { state.range = r; state.page = 1; state.cursors = [null]; state.qOffsets = [null]; writeHash(); render(); } }, r));
   }
   for (const b of document.querySelectorAll(".tabs button")) {
-    b.addEventListener("click", () => { state.tab = b.dataset.tab; state.page = 1; writeHash(); render(); });
+    b.addEventListener("click", () => { state.tab = b.dataset.tab; state.page = 1; state.cursors = [null]; writeHash(); render(); });
   }
   $("#refresh").addEventListener("click", render);
   $("#auto").addEventListener("change", schedule);

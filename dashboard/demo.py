@@ -11,7 +11,7 @@ import random
 import time
 from collections import deque
 
-from backend import HARNESS_TABLES, HISTORY_SAMPLES, POLL_SECONDS, Backend, clean, make_buckets
+from backend import GRANULARITY, HARNESS_TABLES, HISTORY_SAMPLES, PIPELINE, POLL_SECONDS, Backend, clean, make_buckets, percentile
 
 TARGETS = [("juice-shop.lab", "lab"), ("crapi.lab", "lab"), ("vampi.lab", "lab"), ("tenants-api.lab", "lab")]
 PATHS = ["/api/Users/{id}", "/api/BasketItems/{id}", "/rest/basket/{id}", "/identity/api/v2/vehicle/{id}/location",
@@ -149,13 +149,14 @@ class DemoBackend(Backend):
         self.obs.sort(key=lambda o: -o["ts"])
         self.trs.sort(key=lambda t: -t["ts"])
         self.run_of_op = {o["id"]: o["run_id"] for o in self.ops}
+        self.session_of = {t["id"]: t["session_id"] for t in self.trs}
         self.op_of_probe = {p["id"]: p["op_id"] for p in self.probes}
 
     def _fake_history(self, rnd: random.Random) -> None:
         now = time.time()
-        for name in ("litellm", "ollama", "qdrant", "langfuse", "postgres"):
+        for name in ("litellm", "ollama", "qdrant", "langfuse", "postgres", *PIPELINE):
             h = deque(maxlen=HISTORY_SAMPLES)
-            base = {"litellm": 6, "ollama": 9, "qdrant": 3, "langfuse": 40, "postgres": 12}[name]
+            base = {"litellm": 6, "ollama": 9, "qdrant": 3, "langfuse": 40, "postgres": 12}.get(name, 3)
             for i in range(HISTORY_SAMPLES):
                 t = now - (HISTORY_SAMPLES - i) * POLL_SECONDS
                 age_h = (now - t) / 3600
@@ -182,9 +183,14 @@ class DemoBackend(Backend):
                 "collections": [{"name": "findings", "status": "green", "points": sum(1 for v in self.verdicts if v["label"] == "confirmed"),
                                  "indexed": 0, "segments": 2, "vectors": "default: 1024d Cosine"}]}},
             {"name": "langfuse", "ok": True, "ms": 38.5, "error": None,
-             "detail": {"version": "2.95.11", "last_trace_at": last, "traces_total": len(self.trs)}},
+             "detail": {"version": "4.79.0", "last_obs_at": last, "gens_24h": sum(1 for o in self.obs if o["ts"] > now - 86400),
+                        "cost_24h": sum(o["cost"] for o in self.obs if o["ts"] > now - 86400)}},
             {"name": "postgres", "ok": True, "ms": 11.4, "error": None,
              "detail": {"version": "17.6", "size": 412_000_000, "conns": 9, "max_conns": 100, "harness": True}},
+            {"name": "langfuse-worker", "ok": True, "ms": 4.1, "error": None, "detail": {"http": 200}},
+            {"name": "clickhouse", "ok": True, "ms": 2.2, "error": None, "detail": {"http": 200}},
+            {"name": "redis", "ok": True, "ms": 1.1, "error": None, "detail": {"reply": "auth required (alive)"}},
+            {"name": "minio", "ok": True, "ms": 3.0, "error": None, "detail": {"http": 200}},
         ]
         for s in services:
             self.history[s["name"]].append((now, s["ok"], s["ms"]))
@@ -192,24 +198,52 @@ class DemoBackend(Backend):
                          "disk": {"total": 1_000_000_000_000, "used": 690_000_000_000, "free": 310_000_000_000, "free_pct": 31.0}}
 
     async def observations(self, since: float):
-        rows = [o for o in self.obs if o["ts"] >= since]
-        return rows[: self.obs_cap], len(rows)
+        return [o for o in self.obs if o["ts"] >= since]
 
-    async def traces(self, since: float):
-        rows = [t for t in self.trs if t["ts"] >= since]
-        return rows[: self.trace_cap], len(rows)
-
-    async def daily(self, since: float):
+    def _agg(self, since: float, until: float, keyf, rows=None) -> dict:
         acc: dict = {}
-        for o in self.obs:
-            if o["ts"] < since:
+        for o in rows if rows is not None else self.obs:
+            if not (since <= o["ts"] < until):
                 continue
-            day = o["ts"] - o["ts"] % 86400
-            a = acc.setdefault((day, o["route"]), {"ts": day, "route": o["route"], "calls": 0, "tokens": 0, "cost": 0.0})
+            a = acc.setdefault(keyf(o), {"calls": 0, "tokens": 0, "cost": 0.0, "errors": 0, "lat": []})
             a["calls"] += 1
             a["tokens"] += o["in_tok"] + o["out_tok"]
             a["cost"] += o["cost"]
-        return list(acc.values())
+            a["errors"] += o["level"] == "ERROR"
+            a["lat"].append(o["latency_ms"])
+        return acc
+
+    @staticmethod
+    def _bucket(ts: float, gran: str | None) -> float | None:
+        if gran is None:
+            return None
+        step = {v: k for k, v in GRANULARITY.items()}[gran]
+        off = 4 * 86400 if gran == "week" else 0
+        return ts - (ts - off) % step
+
+    async def usage_rows(self, since, until, gran):
+        acc = self._agg(since, until, lambda o: (self._bucket(o["ts"], gran), o["route"]))
+        return [{"ts": k[0], "route": k[1], "calls": a["calls"], "tokens": a["tokens"], "cost": a["cost"],
+                 "p50": percentile(a["lat"], .5), "p95": percentile(a["lat"], .95)} for k, a in acc.items()]
+
+    async def error_rows(self, since, until, gran):
+        acc = self._agg(since, until, lambda o: (self._bucket(o["ts"], gran), o["route"]))
+        return [{"ts": k[0], "route": k[1], "errors": a["errors"]} for k, a in acc.items() if a["errors"]]
+
+    async def route_totals(self, since, until):
+        acc = self._agg(since, until, lambda o: o["route"])
+        return [{"route": k, "calls": a["calls"], "p95": percentile(a["lat"], .95)} for k, a in acc.items()]
+
+    async def step_rows(self, since, until):
+        acc = self._agg(since, until, lambda o: (o["name"], o["route"]))
+        return [{"name": k[0], "route": k[1], "calls": a["calls"], "tokens": a["tokens"], "cost": a["cost"],
+                 "p50": percentile(a["lat"], .5), "p95": percentile(a["lat"], .95), "errors": a["errors"]}
+                for k, a in acc.items()]
+
+    async def session_rows(self, since, until):
+        acc = self._agg(since, until, lambda o: self.session_of[o["trace_id"]])
+        rows = [{"session_id": k, "calls": a["calls"], "cost": a["cost"]} for k, a in acc.items()]
+        return sorted(rows, key=lambda r: -r["cost"])[:200]
 
     async def harness(self, since: float) -> dict:
         probes = {p["id"]: p for p in self.probes if p["created_at"] >= since}
@@ -260,32 +294,32 @@ class DemoBackend(Backend):
 
     # ---- raw -----------------------------------------------------------------
 
-    def _page(self, rows: list, page: int, size: int = 50) -> tuple[list, int]:
-        return rows[(page - 1) * size: page * size], max(1, -(-len(rows) // size))
+    def _cursor_page(self, rows: list, cursor: str | None, size: int = 50) -> tuple[list, str | None]:
+        start = int(cursor) if cursor and cursor.isdigit() else 0
+        return rows[start:start + size], (str(start + size) if start + size < len(rows) else None)
 
-    async def raw_generations(self, rng: str, page: int) -> dict:
+    async def raw_generations(self, rng: str, cursor: str | None) -> dict:
         since = make_buckets(rng)[0][0]
-        rows, pages = self._page([o for o in self.obs if o["ts"] >= since], page)
+        rows, nxt = self._cursor_page([o for o in self.obs if o["ts"] >= since], cursor)
         out = []
         for o in rows:
             inp = f"[{o['name']}] Operation GET /api/Users/{{id}} as identity alice (tenant t1). Summarise the response diff."
             outp = "" if o["level"] == "ERROR" else ('{"interesting": false, "reason": "403 for foreign object"}' if o["route"] == "glue"
                                                      else "Plan: 3 probes (owner swap, tenant swap, role downgrade).")
             raw = {"id": o["id"], "traceId": o["trace_id"], "type": "GENERATION", "name": o["name"], "model": o["model"],
-                   "startTime": o["ts"], "latencyMs": round(o["latency_ms"]), "usage": {"input": o["in_tok"], "output": o["out_tok"]},
-                   "calculatedTotalCost": o["cost"], "level": o["level"], "statusMessage": o["status"],
-                   "input": [{"role": "user", "content": inp}], "output": {"role": "assistant", "content": outp},
-                   "metadata": {"model_group": o["route"]}}
-            out.append({**o, "input": inp, "output": outp, "link": self._lf_link(o["trace_id"]), "raw": raw})
-        return {"rows": out, "page": page, "pages": pages, "total": len([o for o in self.obs if o["ts"] >= since])}
+                   "startTime": o["ts"], "sessionId": self.session_of[o["trace_id"]],
+                   "usageDetails": {"input": o["in_tok"], "output": o["out_tok"]},
+                   "totalCost": o["cost"], "level": o["level"], "statusMessage": o["status"],
+                   "input": f'[{{"role": "user", "content": "{inp}"}}]', "output": outp, "metadata": {"model_group": o["route"]}}
+            out.append({**o, "session_id": self.session_of[o["trace_id"]], "input": inp, "output": outp,
+                        "link": self._lf_link(o["trace_id"]), "raw": raw})
+        return {"rows": out, "next": nxt}
 
-    async def raw_traces(self, rng: str, page: int) -> dict:
+    async def raw_traces(self, rng: str, cursor: str | None) -> dict:
         since = make_buckets(rng)[0][0]
-        allr = [t for t in self.trs if t["ts"] >= since]
-        rows, pages = self._page(allr, page)
-        return {"rows": [{**t, "tags": [], "observations": 1, "input": f"{t['name']} for {t['session_id']}",
-                          "link": self._lf_link(t["id"]), "raw": clean(t)} for t in rows],
-                "page": page, "pages": pages, "total": len(allr)}
+        rows, nxt = self._cursor_page([t for t in self.trs if t["ts"] >= since], cursor)
+        return {"rows": [{**t, "tags": [], "type": "SPAN", "input": f"{t['name']} for {t['session_id']}",
+                          "link": self._lf_link(t["id"]), "raw": clean(t)} for t in rows], "next": nxt}
 
     def _table_rows(self, name: str) -> list[dict]:
         return {"runs": self.runs, "operations": self.ops, "probes": self.probes, "exchanges": self.exchanges,
