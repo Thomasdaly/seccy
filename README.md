@@ -28,7 +28,8 @@ sudo systemctl edit docker
 #   After=tailscaled.service
 #   Wants=tailscaled.service
 #   [Service]
-#   ExecStartPre=/bin/sh -c 'for i in $(seq 30); do ip -4 addr show tailscale0 | grep -q inet && exit 0; sleep 1; done'
+#   ExecStartPre=-/usr/bin/timeout 30 /bin/sh -c 'until ip -4 addr show tailscale0 | grep -q inet; do sleep 1; done'
+#   (no `$` — systemd would expand it; leading `-` so a timeout doesn't block Docker)
 
 sudo systemctl daemon-reload && sudo systemctl restart ollama docker
 ```
