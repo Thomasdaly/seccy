@@ -1,0 +1,54 @@
+# Offline target lab for the harness (guide §4.1: "crAPI, VAmPI, and your own
+# apps with planted authz bugs"). Intentionally-vulnerable APIs used ONLY to
+# measure the harness on the 2060 — recall, false-positive rate, cost per
+# confirmed bug — against known ground truth in ./ground-truth/.
+#
+# SAFETY: these apps are deliberately insecure. Every port binds to TAILNET_IP
+# only (same as the services compose), so the lab is reachable on the tailnet
+# and nowhere else. Never bind to 0.0.0.0 or a public interface, and never
+# point the harness at anything but this lab without an authorized scope.
+#
+# Lives in its own compose project so it stays opt-in and never competes with
+# the always-on services (LiteLLM/Langfuse/Qdrant/Postgres). Run from repo root:
+#
+#   # VAmPI — light, the default first target (vulnerable + secure twins)
+#   docker compose -f lab/docker-compose.lab.yml --profile vampi up -d
+#
+#   # crAPI — heavy, realistic; separate stack, see lab/crapi/README.md
+#
+# VAmPI runs as two instances on purpose: the eval harness scores recall on the
+# vulnerable one and false positives on the secure one (same surface, bugs off).
+name: harness-lab
+
+x-common: &common
+  restart: unless-stopped
+
+services:
+  # VAmPI — Flask, OWASP API Top 10, OpenAPI3 spec in ./specs/vampi-openapi3.yml.
+  # vulnerable=1: BOLA, mass assignment, unauth password change, debug data
+  # exposure, user/pass enumeration are live. Ground truth: ground-truth/vampi.yaml
+  vampi-vuln:
+    <<: *common
+    image: erev0s/vampi@sha256:0a5a224b6e14ae7da6a6ea265178ff71286ff903aec74adee98f660bb0e4ca12
+    profiles: ["vampi", "lab"]
+    environment:
+      vulnerable: "1"
+      tokentimetolive: "600"   # 10 min, long enough for a full run
+    ports: ["${TAILNET_IP:-127.0.0.1}:5061:5000"]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  # Same image, bugs OFF. The false-positive control: anything the harness flags
+  # here is noise, because the authz checks are enforced.
+  vampi-secure:
+    <<: *common
+    image: erev0s/vampi@sha256:0a5a224b6e14ae7da6a6ea265178ff71286ff903aec74adee98f660bb0e4ca12
+    profiles: ["vampi", "lab"]
+    environment:
+      vulnerable: "0"
+      tokentimetolive: "600"
+    ports: ["${TAILNET_IP:-127.0.0.1}:5062:5000"]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }

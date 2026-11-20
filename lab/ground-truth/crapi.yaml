@@ -1,0 +1,106 @@
+# crAPI ground truth — the scoring key for the eval harness.
+#
+# Same contract as vampi.yaml: a labelled map of where the known authz flaws are
+# and which OWASP-API category each falls under, taken from crAPI's own
+# challenge list (docs/challenges.md upstream). No payloads; evidence is the
+# replayable pair the harness captures at run time.
+#
+# crAPI has no vulnerable=0 twin, so false positives are measured differently:
+# endpoints NOT listed here (and the `negatives` block) are expected safe.
+#
+# scope: authz = counted toward recall; other = present but outside an authz
+# tester's remit (SSRF, NoSQL/SQLi, JWT forge, prompt injection), not a miss.
+target:
+  name: crapi
+  base_url: http://${TAILNET_IP}:8888          # crapi-web (see lab/crapi/README.md)
+  spec: ../specs/crapi-openapi3.json            # fetched by lab/crapi/setup.sh
+  identities:
+    # crAPI is multi-tenant: each registered user owns vehicles, orders, reports,
+    # videos. Register two users to get the A-vs-B object pair; the seeded
+    # mechanic + admin roles exercise function-level checks.
+    - { user: "userA (self-registered)", role: user }
+    - { user: "userB (self-registered)", role: user }
+    - { user: "mechanic", role: mechanic }
+
+findings:
+  - id: crapi-bola-vehicle
+    challenge: 1
+    endpoint: GET /identity/api/v2/vehicle/{vehicleId}/location
+    category: API1:2023 Broken Object Level Authorization
+    scope: authz
+    expected: |
+      Vehicle location/details are owner-only. A user reads another user's
+      vehicle by its (non-sequential, GUID) id once that id is obtained.
+
+  - id: crapi-bola-mechanic-report
+    challenge: 2
+    endpoint: GET /workshop/api/mechanic/report/{reportId}
+    category: API1:2023 Broken Object Level Authorization
+    scope: authz
+    expected: |
+      Mechanic reports are keyed by a sequential report id with no ownership
+      check; a user reads other users' reports by changing the id.
+
+  - id: crapi-bfla-delete-video
+    challenge: 7
+    endpoint: DELETE /identity/api/v2/user/videos/{videoId}
+    category: API5:2023 Broken Function Level Authorization
+    scope: authz
+    expected: a user deletes another user's video — function/object authz missing.
+
+  - id: crapi-excessive-video-props
+    challenge: 4,5
+    endpoint: GET /identity/api/v2/user/videos/{videoId}
+    category: API3:2023 Broken Object Property Level Authorization
+    scope: authz
+    expected: |
+      The video resource exposes an internal property (conversion params /
+      admin-only field) that should not be returned to the owner.
+
+  - id: crapi-mass-assignment-order
+    challenge: 8,9,10
+    endpoint: POST /workshop/api/shop/orders & PUT /workshop/api/shop/orders/{id}
+    category: API6:2023 Unrestricted Access to Sensitive Business Flows / Mass Assignment
+    scope: authz
+    expected: |
+      Order/return flow trusts client-supplied fields (quantity/price/balance),
+      letting a user get an item free or inflate their balance.
+
+  - id: crapi-broken-auth-reset
+    challenge: 3
+    endpoint: POST /identity/api/auth/v3/check-otp
+    category: API2:2023 Broken Authentication
+    scope: other
+    expected: OTP reset flow lacks rate limiting, enabling another user's password reset.
+
+  - id: crapi-ssrf
+    challenge: 11
+    endpoint: POST /workshop/api/merchant/contact_mechanic
+    category: API7:2023 Server Side Request Forgery
+    scope: other
+
+  - id: crapi-nosqli-coupon
+    challenge: 12
+    endpoint: POST /community/api/v2/coupon/validate-coupon
+    category: Injection (NoSQL)
+    scope: other
+
+  - id: crapi-unauth-endpoint
+    challenge: 14
+    endpoint: "(undocumented endpoint, no auth check)"
+    category: API5:2023 Broken Function Level Authorization (unauthenticated access)
+    scope: authz
+    expected: an endpoint performs no authentication check at all.
+
+  - id: crapi-jwt-forge
+    challenge: 15
+    endpoint: "* (Authorization: Bearer)"
+    category: API2:2023 Broken Authentication (JWT forgery)
+    scope: other
+
+negatives:
+  # crAPI login/signup and the user's own resources accessed as the owner are
+  # expected safe; flagging owner-as-owner access is a false positive.
+  - POST /identity/api/auth/login
+  - POST /identity/api/auth/signup
+  - GET  /identity/api/v2/user/dashboard   # as the owning user

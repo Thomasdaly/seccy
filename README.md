@@ -5,7 +5,7 @@ See docs/harness-stack-guide.md. Never commit `.env`.
 
 - `docker-compose.yml`, `litellm.config.yaml` — services on the 2060 (WSL2)
 - `orchestrator/` — uv project, agent loop on the M1 (see its README)
-- `lab/` — planted-bug targets
+- `lab/` — offline target range (VAmPI, crAPI) + authz ground truth for scoring (see its README)
 - `dashboard/` — read-only console (health, trends, flows, raw) at `http://<TAILNET_IP>:8080`
 - `db/harness.sql` — findings schema (runs → verdicts, guardrail events) + the dashboard's read-only role
 

@@ -1,0 +1,101 @@
+# VAmPI ground truth — the scoring key for the eval harness.
+#
+# What this is: the labelled map of which operations carry an authz flaw when
+# VAmPI runs with vulnerable=1, so the harness can be scored on recall (did it
+# find the known bugs?) and, against the vulnerable=0 twin, false-positive rate
+# (did it flag an endpoint that is actually safe?).
+#
+# It describes WHERE a bug is and WHICH OWASP-API category it falls under — not
+# how to exploit it. No payloads live here; evidence of a real finding is the
+# replayable request/response pair the harness captures at run time.
+#
+# scope:
+#   authz  — broken object/function-level authorization. This is what the
+#            harness is built to find, so these count toward recall.
+#   other  — a real VAmPI bug (injection, enumeration, weak JWT key) that an
+#            authorization tester is not designed to catch. Listed for
+#            completeness; NOT counted as a miss if the harness skips it.
+#
+# target: the vulnerable instance from docker-compose.lab.yml
+target:
+  name: vampi
+  base_url: http://${TAILNET_IP}:5061        # vulnerable=1
+  control_url: http://${TAILNET_IP}:5062      # vulnerable=0 (false-positive control)
+  spec: ../specs/vampi-openapi3.yml
+  seed: GET /createdb                         # populates dummy users + books first
+  identities:
+    # VAmPI seeds these dummy users (see /createdb). Two non-admin users give the
+    # harness its A-vs-B object-access pair; admin exercises function-level checks.
+    - { user: name1, role: user,  owns: "book 'bookTitle77'" }
+    - { user: name2, role: user,  owns: "another user's book" }
+    - { user: admin, role: admin }
+
+findings:
+  - id: vampi-bola-books
+    endpoint: GET /books/v1/{book_title}
+    category: API1:2023 Broken Object Level Authorization
+    scope: authz
+    expected: |
+      A book's secret is owner-only. With vulnerable=1 any authenticated user
+      retrieves any other user's book (and its secret) by title — no ownership
+      check. The harness should confirm: identity A reads identity B's object.
+    oracle: |
+      Same request as owner vs non-owner returns the secret in both cases on the
+      vulnerable twin; the secure twin denies the non-owner.
+
+  - id: vampi-bfla-password
+    endpoint: PUT /users/v1/{username}/password
+    category: API5:2023 Broken Function Level Authorization
+    scope: authz
+    expected: |
+      Password change authorizes by the token's user but acts on the {username}
+      in the path. With vulnerable=1 user A changes user B's password
+      (unauthorized password change). The secure twin binds the action to the
+      caller.
+    oracle: |
+      A's token + B's username succeeds (200) on the vulnerable twin, denied on
+      the secure twin.
+
+  - id: vampi-bfla-delete
+    endpoint: DELETE /users/v1/{username}
+    category: API5:2023 Broken Function Level Authorization
+    scope: authz
+    expected: |
+      Deletion is documented admin-only. With vulnerable=1 a non-admin token is
+      accepted. Function-level check missing.
+    oracle: non-admin delete succeeds on the vulnerable twin, 401/403 on the secure twin.
+
+  - id: vampi-excessive-debug
+    endpoint: GET /users/v1/_debug
+    category: API3:2023 Broken Object Property Level Authorization (excessive data exposure)
+    scope: authz
+    expected: |
+      Returns every user's full record, password field included, to an
+      unauthenticated caller. A property-level authorization failure.
+    oracle: response body carries password fields for all users.
+
+  - id: vampi-enum-login
+    endpoint: POST /users/v1/login
+    category: API2:2023 Broken Authentication (user/password enumeration)
+    scope: other
+    expected: distinct responses for unknown-user vs wrong-password reveal valid usernames.
+
+  - id: vampi-sqli
+    endpoint: POST /users/v1/login
+    category: Injection (SQLi)
+    scope: other
+    expected: username/password fields reach an unparameterised SQL query under vulnerable=1.
+
+  - id: vampi-jwt-weak-key
+    endpoint: "* (Authorization: Bearer)"
+    category: API2:2023 Broken Authentication (weak JWT signing key)
+    scope: other
+    expected: tokens are signed with a guessable key, allowing forgery.
+
+# Negative controls — safe endpoints. Flagging any of these is a false positive.
+negatives:
+  - GET /users/v1          # basic public listing by design
+  - GET /                  # home
+  - POST /users/v1/register  # registration itself (mass-assignment variant is a
+                             # separate property-level concern; the bare endpoint
+                             # is not an authz bug)
