@@ -63,7 +63,9 @@ docker compose exec -T postgres psql -U postgres -tAc "SELECT 1 FROM pg_database
 # Harness findings schema + the dashboard's read-only role (idempotent)
 DB_RO=$(grep '^DASHBOARD_DB_PASSWORD=' .env | cut -d= -f2-)
 [ -n "$DB_RO" ] || { echo "set DASHBOARD_DB_PASSWORD in .env"; exit 1; }
-docker compose exec -T postgres psql -U postgres -q -v ON_ERROR_STOP=1 -v ro_password="$DB_RO" < db/harness.sql
+DB_RW=$(grep '^HARNESS_DB_PASSWORD=' .env | cut -d= -f2- || true)   # optional: orchestrator writer role
+docker compose exec -T postgres psql -U postgres -q -v ON_ERROR_STOP=1 -v ro_password="$DB_RO" \
+  ${DB_RW:+-v rw_password="$DB_RW"} < db/harness.sql
 docker compose up -d --build --remove-orphans
 
 step "health (waiting up to 3 min for langfuse + clickhouse migrations)"

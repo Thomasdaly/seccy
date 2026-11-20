@@ -1,7 +1,8 @@
--- Harness findings DB (guide §8 run schema + guardrail events) and the
--- dashboard's read-only role. Idempotent; setup-2060.sh applies it with:
+-- Harness findings DB (guide §8 run schema + guardrail events), the
+-- dashboard's read-only role and the orchestrator's writer role. Idempotent;
+-- setup-2060.sh applies it with:
 --   docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 \
---     -v ro_password="$DASHBOARD_DB_PASSWORD" < db/harness.sql
+--     -v ro_password="$DASHBOARD_DB_PASSWORD" [-v rw_password="$HARNESS_DB_PASSWORD"] < db/harness.sql
 -- Lives in the default `postgres` database; Langfuse has its own `langfuse` DB.
 --
 -- Orchestrator contract (what the dashboard reads):
@@ -93,3 +94,17 @@ alter role dashboard_ro set statement_timeout = '5s';
 grant usage on schema harness to dashboard_ro;
 grant select on all tables in schema harness to dashboard_ro;
 alter default privileges in schema harness grant select on tables to dashboard_ro;
+
+-- Orchestrator role (HARNESS_DATABASE_URL on the M1): writes runs, never deletes,
+-- no DDL, nothing outside schema harness. Only created when rw_password is passed.
+\if :{?rw_password}
+select 'create role harness_rw login' where not exists (select from pg_roles where rolname = 'harness_rw')
+\gexec
+alter role harness_rw password :'rw_password';
+alter role harness_rw set statement_timeout = '30s';
+grant usage on schema harness to harness_rw;
+grant select, insert, update on all tables in schema harness to harness_rw;
+grant usage, select on all sequences in schema harness to harness_rw;
+alter default privileges in schema harness grant select, insert, update on tables to harness_rw;
+alter default privileges in schema harness grant usage, select on sequences to harness_rw;
+\endif
