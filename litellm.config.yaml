@@ -11,7 +11,10 @@ model_list:
     litellm_params: { model: openrouter/z-ai/glm-4.6, input_cost_per_token: 0.0000005, output_cost_per_token: 0.000002 }
   # Tier 2 — frontier, hard steps only
   - model_name: judge
-    litellm_params: { model: anthropic/claude-fable-5-2 }   # rare by design: final verdicts + stalled runs
+    # Price it so judge spend is metered (principle 5). Not in LiteLLM's built-in
+    # cost map, so without this its cost logs as $0. Claude Fable 5.2 list price
+    # $8 / $40 per M tokens (guide §2); recheck when it changes.
+    litellm_params: { model: anthropic/claude-fable-5-2, input_cost_per_token: 0.000008, output_cost_per_token: 0.00004 }   # rare by design: final verdicts + stalled runs
 litellm_settings:                    # keys: LANGFUSE_PUBLIC_KEY/SECRET_KEY/HOST in .env
   success_callback: ["langfuse"]     # every call → cost + trace
   failure_callback: ["langfuse"]
