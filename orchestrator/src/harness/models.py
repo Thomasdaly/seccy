@@ -24,6 +24,19 @@ from .config import Config
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
+def _cost_of(response: httpx.Response, data: dict) -> float:
+    """LiteLLM's computed USD cost. It rides in the x-litellm-response-cost
+    header for every provider; only some (e.g. OpenRouter) also echo it in
+    usage.cost. Header first, JSON body as fallback."""
+    hdr = response.headers.get("x-litellm-response-cost")
+    if hdr:
+        try:
+            return float(hdr)
+        except ValueError:
+            pass
+    return float(data.get("usage", {}).get("cost", 0.0) or 0.0)
+
+
 @dataclass
 class Usage:
     calls: int = 0
@@ -76,7 +89,7 @@ class Models:
         r = self._client.post("/v1/chat/completions", json=body)
         r.raise_for_status()
         data = r.json()
-        self.usage.add(model, float(data.get("usage", {}).get("cost", 0.0) or 0.0))
+        self.usage.add(model, _cost_of(r, data))
         return data["choices"][0]["message"].get("content") or ""
 
     def _chat_json(self, model: str, step: str, messages: list[dict], max_tokens: int = 512) -> dict:
@@ -132,7 +145,7 @@ class Models:
             r = self._client.post("/v1/embeddings", json=body)
             r.raise_for_status()
             data = r.json()
-            self.usage.add(self.cfg.model_embed, float(data.get("usage", {}).get("cost", 0.0) or 0.0))
+            self.usage.add(self.cfg.model_embed, _cost_of(r, data))
             return data["data"][0]["embedding"]
         except Exception as e:
             print(f"[models] embed/{step} failed ({type(e).__name__}) — dedup treats as unique")
