@@ -634,6 +634,7 @@ dependencies = [
     { name = "litellm" },
     { name = "playwright" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "pyyaml" },
     { name = "qdrant-client" },
 ]
 
@@ -645,6 +646,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.110.0" },
     { name = "playwright", specifier = ">=1.65.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.9" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "qdrant-client", specifier = ">=1.20.0" },
 ]
 

@@ -1,101 +1,137 @@
 # VAmPI ground truth — the scoring key for the eval harness.
 #
-# What this is: the labelled map of which operations carry an authz flaw when
-# VAmPI runs with vulnerable=1, so the harness can be scored on recall (did it
-# find the known bugs?) and, against the vulnerable=0 twin, false-positive rate
-# (did it flag an endpoint that is actually safe?).
+# What this is: the labelled map of which operations carry a flaw when VAmPI
+# runs with vulnerable=1, verified against VAmPI's source (api_views/*, models/*),
+# so the harness can be scored on recall (did it find the known authz bugs?) and
+# false-positive rate (did it flag something actually safe?).
 #
 # It describes WHERE a bug is and WHICH OWASP-API category it falls under — not
-# how to exploit it. No payloads live here; evidence of a real finding is the
-# replayable request/response pair the harness captures at run time.
+# how to exploit it. No payloads; evidence of a real finding is the replayable
+# request/response pair the harness captures at run time (principle 3).
 #
-# scope:
-#   authz  — broken object/function-level authorization. This is what the
-#            harness is built to find, so these count toward recall.
-#   other  — a real VAmPI bug (injection, enumeration, weak JWT key) that an
-#            authorization tester is not designed to catch. Listed for
-#            completeness; NOT counted as a miss if the harness skips it.
+# Fields per finding:
+#   scope: authz — broken object/function/property-level authorization or
+#                  privilege escalation. What the harness is built to find, so
+#                  these are the recall denominator.
+#          other — a real VAmPI bug (SQLi, enumeration, ReDoS, weak JWT key) an
+#                  authorization tester isn't designed to catch. NOT a miss.
+#   gated: true  — the `vulnerable` flag toggles it, so the secure twin (:5062)
+#                  is a valid false-positive control: flag it there = FP.
+#          false — present on BOTH twins (not flag-gated). The secure twin is
+#                  NOT a control for it; detecting it on either twin is a true
+#                  positive.
 #
-# target: the vulnerable instance from docker-compose.lab.yml
+# Scoring a run:
+#   recall          = confirmed authz findings / authz findings below
+#   false positives = anything flagged on :5062 for a gated:true finding, or any
+#                     endpoint in `negatives` on either twin
+#   cost per bug    = Langfuse run spend / confirmed findings (guide §8)
+
 target:
   name: vampi
   base_url: http://${TAILNET_IP}:5061        # vulnerable=1
   control_url: http://${TAILNET_IP}:5062      # vulnerable=0 (false-positive control)
   spec: ../specs/vampi-openapi3.yml
-  seed: GET /createdb                         # populates dummy users + books first
+  seed: GET /createdb                         # populates the users + books below
   identities:
-    # VAmPI seeds these dummy users (see /createdb). Two non-admin users give the
-    # harness its A-vs-B object-access pair; admin exercises function-level checks.
-    - { user: name1, role: user,  owns: "book 'bookTitle77'" }
-    - { user: name2, role: user,  owns: "another user's book" }
-    - { user: admin, role: admin }
+    # /createdb seeds these three. Each registered user is given one book titled
+    # "bookTitle<random>" with secret "secret for bookTitle<random>"; titles are
+    # discoverable via GET /books/v1, which drives the BOLA test (A reads B's).
+    - { user: name1, pass: pass1,  role: user }
+    - { user: name2, pass: pass2,  role: user }
+    - { user: admin, pass: pass1,  role: admin }
 
 findings:
+  # ---- authz (counted for recall) ----
   - id: vampi-bola-books
     endpoint: GET /books/v1/{book_title}
     category: API1:2023 Broken Object Level Authorization
     scope: authz
-    expected: |
-      A book's secret is owner-only. With vulnerable=1 any authenticated user
-      retrieves any other user's book (and its secret) by title — no ownership
-      check. The harness should confirm: identity A reads identity B's object.
+    gated: true
+    source: api_views/books.py get_by_title — `if vuln:` returns any book by
+      title with no owner check; else scopes the lookup to the token's user.
     oracle: |
-      Same request as owner vs non-owner returns the secret in both cases on the
-      vulnerable twin; the secure twin denies the non-owner.
+      As name1, fetch name2's book title (from GET /books/v1). Vulnerable twin
+      returns 200 with name2's `secret` + `owner`; secure twin returns 404
+      "Book not found!" because the query is owner-scoped.
 
   - id: vampi-bfla-password
     endpoint: PUT /users/v1/{username}/password
-    category: API5:2023 Broken Function Level Authorization
+    category: API5:2023 Broken Function Level Authorization (unauthorized password change)
     scope: authz
-    expected: |
-      Password change authorizes by the token's user but acts on the {username}
-      in the path. With vulnerable=1 user A changes user B's password
-      (unauthorized password change). The secure twin binds the action to the
-      caller.
+    gated: true
+    source: api_views/users.py update_password — `if vuln:` updates the password
+      of the {username} in the path; else always updates the caller (resp['sub']).
     oracle: |
-      A's token + B's username succeeds (200) on the vulnerable twin, denied on
-      the secure twin.
+      State-based, not status-based (both twins return 204). As name1, PUT a new
+      password for name2. Vulnerable twin: name2's password is changed (name2 can
+      no longer log in with pass2; the new password works). Secure twin: name2 is
+      unchanged and name1's own password changed instead.
 
-  - id: vampi-bfla-delete
-    endpoint: DELETE /users/v1/{username}
-    category: API5:2023 Broken Function Level Authorization
+  - id: vampi-massassign-admin
+    endpoint: POST /users/v1/register
+    category: API3:2023 Broken Object Property Level Authorization (mass assignment → privilege escalation)
     scope: authz
-    expected: |
-      Deletion is documented admin-only. With vulnerable=1 a non-admin token is
-      accepted. Function-level check missing.
-    oracle: non-admin delete succeeds on the vulnerable twin, 401/403 on the secure twin.
+    gated: true
+    source: api_views/users.py register_user — `if vuln and 'admin' in request_data:`
+      honours a client-supplied `admin` field at registration.
+    oracle: |
+      Register a user with `"admin": true` in the body. Vulnerable twin creates
+      an admin (GET /me / _debug shows admin=true), which then passes the
+      admin-only DELETE check. Secure twin ignores the field (admin=false).
 
   - id: vampi-excessive-debug
     endpoint: GET /users/v1/_debug
     category: API3:2023 Broken Object Property Level Authorization (excessive data exposure)
     scope: authz
-    expected: |
-      Returns every user's full record, password field included, to an
-      unauthenticated caller. A property-level authorization failure.
-    oracle: response body carries password fields for all users.
+    gated: false            # NOT flag-gated — returns every user's password on BOTH twins
+    source: api_views/users.py debug + models get_all_users_debug/json_debug —
+      no `if vuln`; always returns the full record incl. password, unauthenticated.
+    oracle: unauthenticated GET returns password fields for all users on both twins.
+
+  # ---- other (real bugs, outside an authz tester's remit; not counted) ----
+  - id: vampi-sqli-username
+    endpoint: GET /users/v1/{username}
+    category: Injection (SQLi)
+    scope: other
+    gated: true
+    source: models/user_model.py get_user — `if vuln:` builds
+      `f"SELECT * FROM users WHERE username = '{username}'"` (raw f-string).
 
   - id: vampi-enum-login
     endpoint: POST /users/v1/login
     category: API2:2023 Broken Authentication (user/password enumeration)
     scope: other
-    expected: distinct responses for unknown-user vs wrong-password reveal valid usernames.
+    gated: true
+    source: api_views/users.py login_user — `if vuln:` returns distinct
+      "Username does not exist" vs "Password is not correct…"; else one generic error.
 
-  - id: vampi-sqli
-    endpoint: POST /users/v1/login
-    category: Injection (SQLi)
+  - id: vampi-redos-email
+    endpoint: PUT /users/v1/{username}/email
+    category: API4:2023 Unrestricted Resource Consumption (ReDoS)
     scope: other
-    expected: username/password fields reach an unparameterised SQL query under vulnerable=1.
+    gated: true
+    source: api_views/users.py update_email — `if vuln:` validates with a
+      catastrophic-backtracking email regex.
 
   - id: vampi-jwt-weak-key
     endpoint: "* (Authorization: Bearer)"
     category: API2:2023 Broken Authentication (weak JWT signing key)
     scope: other
-    expected: tokens are signed with a guessable key, allowing forgery.
+    gated: false
+    source: models/user_model.py encode/decode_auth_token — HS256 signed with
+      config SECRET_KEY; weak/guessable key allows forgery (config-level, both twins).
 
-# Negative controls — safe endpoints. Flagging any of these is a false positive.
+# Enforced controls + safe endpoints. Flagging any of these on either twin is a
+# false positive.
 negatives:
-  - GET /users/v1          # basic public listing by design
-  - GET /                  # home
-  - POST /users/v1/register  # registration itself (mass-assignment variant is a
-                             # separate property-level concern; the bare endpoint
-                             # is not an authz bug)
+  - endpoint: DELETE /users/v1/{username}
+    note: admin-only check (`if user.admin`) is enforced on BOTH twins — not a
+      bug in VAmPI. A non-admin gets 401 "Only Admins may delete users!".
+  - endpoint: GET /users/v1
+    note: public listing by design; returns username + email only.
+  - endpoint: GET /
+    note: home / version banner.
+  - endpoint: GET /users/v1/{username}
+    note: on the secure twin the lookup is parameterised and returns only
+      username + email (no password) — safe. (Vulnerable twin = vampi-sqli-username.)
