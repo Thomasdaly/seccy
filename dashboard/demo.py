@@ -12,8 +12,10 @@ import time
 from collections import deque
 
 from backend import GRANULARITY, HARNESS_TABLES, HISTORY_SAMPLES, PIPELINE, POLL_SECONDS, Backend, clean, make_buckets, percentile
+from lab import parse_endpoints
 
-TARGETS = [("juice-shop.lab", "lab"), ("crapi.lab", "lab"), ("vampi.lab", "lab"), ("tenants-api.lab", "lab")]
+TARGETS = [("juice-shop.lab", "lab"), ("crapi.lab", "lab"), ("vampi.lab", "lab"), ("vampi.lab", "lab"),
+           ("vampi-control.lab", "lab"), ("tenants-api.lab", "lab")]
 PATHS = ["/api/Users/{id}", "/api/BasketItems/{id}", "/rest/basket/{id}", "/identity/api/v2/vehicle/{id}/location",
          "/workshop/api/shop/orders/{id}", "/users/v1/{username}", "/books/v1/{title}", "/tenants/{tid}/invoices/{id}",
          "/tenants/{tid}/members", "/api/Feedbacks/{id}", "/community/api/v2/community/posts/{id}", "/api/Cards/{id}"]
@@ -59,6 +61,11 @@ class DemoBackend(Backend):
         self.obs, self.trs, self.runs, self.ops, self.probes = [], [], [], [], []
         self.exchanges, self.verdicts, self.guards = [], [], []
         oid = pid = eid = vid = gid = 0
+        lab = self.lab
+        lab_ops: dict[str, list[tuple[str, str]]] = {}
+        for t in lab.targets.values():  # lab runs hit the ground-truth endpoints plus a few clean ones
+            eps = [ep for f in t.findings + t.negatives for ep in parse_endpoints(f["endpoint"])]
+            lab_ops[t.name] = sorted(set(eps)) + [("GET", "/healthz"), ("GET", "/static/{file}")]
 
         def call(route: str, t: float, run_id: str, name: str | None = None):
             s = _shape(rnd, route, (now - t) / 86400)
@@ -80,6 +87,7 @@ class DemoBackend(Backend):
                 if start > now - 1800:
                     start = now - rnd.uniform(1800, 7200)
                 target, program = rnd.choice(TARGETS)
+                lab_t, twin = lab.target_of(target)
                 rid = f"run-{time.strftime('%m%d', time.gmtime(start))}-{len(self.runs):03d}"
                 age = (now - start) / 86400
                 interesting_rate = 0.05 + 0.10 * (age / 90)  # classifier improving
@@ -88,9 +96,14 @@ class DemoBackend(Backend):
                 findings = 0
                 for _ in range(n_ops):
                     oid += 1
-                    method = rnd.choice(["GET", "GET", "GET", "PUT", "DELETE", "PATCH"])
-                    self.ops.append({"id": oid, "run_id": rid, "method": method, "path": rnd.choice(PATHS),
-                                     "schema_source": rnd.choice(["openapi", "openapi", "graphql", "apk"]), "created_at": t})
+                    if lab_t:
+                        method, path = rnd.choice(lab_ops[lab_t.name])
+                        truth = lab_t.classify(method, path, twin)[0]
+                    else:
+                        method, path, truth = rnd.choice(["GET", "GET", "GET", "PUT", "DELETE", "PATCH"]), rnd.choice(PATHS), None
+                    self.ops.append({"id": oid, "run_id": rid, "method": method, "path": path,
+                                     "schema_source": "openapi" if lab_t else rnd.choice(["openapi", "openapi", "graphql", "apk"]),
+                                     "created_at": t})
                     t += rnd.uniform(2, 8)
                     call("glue", t, rid, "classify_op")
                     t += rnd.uniform(5, 15)
@@ -98,7 +111,9 @@ class DemoBackend(Backend):
                     for _ in range(rnd.randint(2, 4)):
                         pid += 1
                         identity = rnd.choice(["alice", "bob", "mallory", "admin-t2"])
-                        interesting = rnd.random() < interesting_rate
+                        skill = 1 - age / 90  # 0 (90 days ago) .. 1 (today): recall up, false positives down
+                        rate = {"tp": 0.35 + 0.45 * skill, "fp": 0.18 - 0.12 * skill, "other": 0.12}.get(truth, interesting_rate)
+                        interesting = rnd.random() < rate
                         self.probes.append({"id": pid, "op_id": oid, "identity": identity,
                                             "tenant": rnd.choice(["t1", "t2"]), "role": rnd.choice(["user", "admin", "viewer"]),
                                             "intent": rnd.choice(["cross-tenant read", "horizontal read", "vertical write", "owner swap"]),
@@ -114,7 +129,8 @@ class DemoBackend(Backend):
                             t += rnd.uniform(5, 20)
                             j = call("judge", t, rid)
                             r = rnd.random()
-                            label = "confirmed" if r < 0.22 else ("needs_review" if r < 0.30 else "rejected")
+                            p_conf = {"tp": 0.75, "fp": 0.35 - 0.25 * skill, "other": 0.3}.get(truth, 0.22)
+                            label = "confirmed" if r < p_conf else ("needs_review" if r < p_conf + 0.08 else "rejected")
                             evidence = f"artifacts/{rid}/{pid}.har" if label == "confirmed" else None
                             if label == "confirmed" and d == 2 and not any(v["evidence_ref"] is None and v["label"] == "confirmed" for v in self.verdicts):
                                 evidence = None
@@ -151,6 +167,10 @@ class DemoBackend(Backend):
         self.run_of_op = {o["id"]: o["run_id"] for o in self.ops}
         self.session_of = {t["id"]: t["session_id"] for t in self.trs}
         self.op_of_probe = {p["id"]: p["op_id"] for p in self.probes}
+        self.op_by_id = {o["id"]: o for o in self.ops}
+        self.probe_by_id = {p["id"]: p for p in self.probes}
+        self.run_by_id = {r["id"]: r for r in self.runs}
+        self.exchange_of = {e["probe_id"]: e for e in self.exchanges}  # ids ascend, so the last one wins
 
     def _fake_history(self, rnd: random.Random) -> None:
         now = time.time()
@@ -247,7 +267,7 @@ class DemoBackend(Backend):
         rows = [{"session_id": k, "calls": a["calls"], "cost": a["cost"]} for k, a in acc.items()]
         return sorted(rows, key=lambda r: -r["cost"])[:200]
 
-    async def harness(self, since: float) -> dict:
+    async def harness(self, since: float, limit: int = 50) -> dict:
         probes = {p["id"]: p for p in self.probes if p["created_at"] >= since}
         verdicts = [v for v in self.verdicts if v["probe_id"] in probes]
         conf = [v for v in verdicts if v["label"] == "confirmed"]
@@ -270,7 +290,7 @@ class DemoBackend(Backend):
             by_kind[g["kind"]] = by_kind.get(g["kind"], 0) + 1
         kills = sorted((g for g in self.guards if g["kind"] == "kill_switch"), key=lambda g: -g["ts"])
         runs = []
-        for r in sorted((r for r in self.runs if r["started_at"] >= since), key=lambda r: -r["started_at"])[:50]:
+        for r in sorted((r for r in self.runs if r["started_at"] >= since), key=lambda r: -r["started_at"])[:limit]:
             ops = [o["id"] for o in self.ops if o["run_id"] == r["id"]]
             ops_set = set(ops)
             pr = {p["id"] for p in self.probes if p["op_id"] in ops_set}
@@ -285,6 +305,47 @@ class DemoBackend(Backend):
             "kill_switch": {"state": "engaged" if kills[0]["detail"].startswith("engag") else "released", "at": kills[0]["ts"]} if kills else None,
             "runs": runs,
         }
+
+    async def verdict_rows(self, since: float | None = None, run_id: str | None = None) -> list[dict]:
+        out = []
+        for v in sorted(self.verdicts, key=lambda v: -v["judged_at"]):
+            p = self.probe_by_id[v["probe_id"]]
+            o = self.op_by_id[p["op_id"]]
+            if run_id is not None:
+                if o["run_id"] != run_id:
+                    continue
+            elif v["judged_at"] < (since or 0) or v["label"] not in ("confirmed", "needs_review"):
+                continue
+            r = self.run_by_id.get(o["run_id"]) or {}
+            e = self.exchange_of.get(p["id"]) or {}
+            out.append({"id": v["id"], "judged_at": v["judged_at"], "label": v["label"], "severity": v["severity"],
+                        "is_duplicate": v["is_duplicate"], "evidence_ref": v["evidence_ref"], "trace_id": v["trace_id"],
+                        "run_id": o["run_id"], "target": r.get("target"), "run_status": r.get("status"),
+                        "method": o["method"], "path": o["path"], "probe_id": p["id"], "identity": p["identity"],
+                        "tenant": p["tenant"], "role": p["role"], "intent": p["intent"],
+                        "status_code": e.get("status_code"), "request_blob": e.get("request_blob"),
+                        "response_blob": e.get("response_blob")})
+        return out[:5000]
+
+    async def run_rows(self, since: float, limit: int) -> list[dict]:
+        return (await self.harness(since, limit))["runs"]
+
+    async def run_row(self, run_id: str) -> tuple[dict | None, list[dict]]:
+        r = self.run_by_id.get(run_id)
+        if not r:
+            return None, []
+        ops = {o["id"] for o in self.ops if o["run_id"] == run_id}
+        probes = [p for p in self.probes if p["op_id"] in ops]
+        pids = {p["id"] for p in probes}
+        guards = [{"t": g["ts"], "kind": g["kind"], "host": g["host"], "detail": g["detail"]}
+                  for g in sorted(self.guards, key=lambda g: -g["ts"]) if g["run_id"] == run_id]
+        return {**r, "operations": len(ops), "probes": len(probes), "interesting": sum(1 for p in probes if p["interesting"]),
+                "executed": len({e["probe_id"] for e in self.exchanges if e["probe_id"] in pids})}, guards
+
+    async def run_step_rows(self, run_id: str, since: float, until: float) -> list[dict]:
+        rows = [o for o in self.obs if self.session_of[o["trace_id"]] == run_id]
+        acc = self._agg(since, until, lambda o: (o["name"], o["route"]), rows)
+        return [{"name": k[0], "route": k[1], "calls": a["calls"], "cost": a["cost"], "tokens": a["tokens"]} for k, a in acc.items()]
 
     async def probe_routes(self) -> dict:
         return {"at": time.time(), "results": [
@@ -334,7 +395,7 @@ class DemoBackend(Backend):
             raise ValueError(f"unknown table {name!r}")
         key = HARNESS_TABLES[name]
         allr = sorted(self._table_rows(name), key=lambda r: -(r[key] if isinstance(r[key], (int, float)) else 0))
-        rows, _ = self._page(allr, page)
+        rows = allr[(page - 1) * 50:page * 50]
         ts_cols = {"created_at", "started_at", "ended_at", "judged_at", "ts"}
         rows = [{k: (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(v)) if k in ts_cols and v else v) for k, v in r.items()} for r in rows]
         return {"columns": list(rows[0]) if rows else [], "rows": rows, "page": page, "more": page * 50 < len(allr)}

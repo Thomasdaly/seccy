@@ -2,7 +2,7 @@ FROM python:3.13-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py backend.py demo.py ./
+COPY app.py backend.py demo.py lab.py ./
 COPY static ./static
 USER nobody
 EXPOSE 8080

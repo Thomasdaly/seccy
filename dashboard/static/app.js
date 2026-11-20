@@ -112,7 +112,7 @@ const routeKey = (route, kind = "dot") => h("span", { class: "cell-key" }, h("sp
 
 // ---------------------------------------------------------------- state
 const state = { tab: "health", range: "7d", raw: "generations", page: 1, table: null, collection: null, meta: null, cache: {}, timer: null, sql: "" };
-const TABS = ["health", "trends", "flows", "raw"];
+const TABS = ["health", "trends", "flows", "findings", "eval", "raw"];
 
 function readHash() {
   const [tab, q] = location.hash.replace(/^#\/?/, "").split("?");
@@ -120,10 +120,12 @@ function readHash() {
   const p = new URLSearchParams(q || "");
   if (p.get("range") && ["24h", "7d", "30d", "90d"].includes(p.get("range"))) state.range = p.get("range");
   if (p.get("raw")) state.raw = p.get("raw");
+  state.run = p.get("run") || null;
 }
 function writeHash() {
   const q = new URLSearchParams({ range: state.range });
   if (state.tab === "raw") q.set("raw", state.raw);
+  if (state.run) q.set("run", state.run);
   history.replaceState(null, "", `#/${state.tab}?${q}`);
 }
 
@@ -497,13 +499,288 @@ function renderFlows(d) {
       { label: "LLM calls", key: "calls", fmt: fmtInt, align: "r" },
       { label: "LLM spend", key: "cost", fmt: fmtUSD, align: "r" },
       { label: "Per finding", key: "cost_per_finding", fmt: fmtUSD, align: "r" },
-    ], d.runs, { empty: "No runs in this range.", cap: 15 }));
+    ], d.runs, { onRow: (r) => (r.tracked ? openRun(r.id) : openDrawer(`Session ${r.id}`, r)), empty: "No runs in this range.", cap: 15 }));
 
   return [
     h("p", { class: "lede" }, h("strong", {}, "Where does the work and money go? "), "Route tiers from glue to judge, the agent loop's funnel from mapped operations to unique findings, and the guardrails around it."),
     notices(d.notes),
     h("div", { class: "stack" }, flowCard, h("div", { class: "grid g2" }, funnelCard, guardCard), stepsCard, runsCard),
   ];
+}
+
+// ================================================================= shared: verdicts, runs
+
+const OUTCOME = {
+  tp: ["good", "true positive", "Matches a known authz bug in the ground truth."],
+  fp: ["critical", "false positive", "Flagged a negative endpoint, or a flag-gated bug on the secure control twin."],
+  other: ["unknown", "non-authz bug", "Matches a real bug outside an authz tester's remit (SQLi, SSRF, …). Not counted."],
+  unmatched: ["warning", "not in ground truth", "Novel or false: a human needs to triage it."],
+};
+const SEV_ORDER = ["critical", "high", "medium", "low", "info", "unrated"];
+const SEV_COLOR = { critical: "var(--critical)", high: "var(--serious)", medium: "var(--warning)", low: "var(--s1)", info: "var(--s-other)", unrated: "var(--s-other)" };
+
+const endpoint = (r) => h("span", { class: "mono" }, h("strong", {}, r.method || "?"), " ", r.path || "");
+const gtCell = (r) => {
+  if (!r.lab) return h("span", { class: "muted" }, "—");
+  if (!r.outcome) return h("span", { class: "muted" }, r.lab);
+  const [st, label] = OUTCOME[r.outcome];
+  const id = r.outcome === "tp" || r.outcome === "other" ? r.gt_id : null;
+  return h("span", { class: "cell-key", title: `${label}${r.gt_id ? ` · ${r.gt_id}` : ""} (${r.lab} ${r.twin} twin)` },
+    statusIcon(st), id ? h("span", { class: "mono" }, id) : h("span", { class: "ink2" }, label));
+};
+const labelBadge = (r) => {
+  if (r.label === "needs_review") return badge("warning", "needs review");
+  if (r.label === "rejected") return badge("unknown", "rejected");
+  if (!r.evidence_ref) return badge("critical", "no evidence");
+  if (r.is_duplicate) return badge("unknown", "duplicate");
+  return badge("good", "finding");
+};
+const sevCell = (r) => (r.severity ? h("span", { class: "cell-key" }, h("span", { class: "key-dot", style: { background: SEV_COLOR[r.severity.toLowerCase()] || "var(--s-other)" } }), r.severity) : h("span", { class: "muted" }, "—"));
+const linkTo = (url, text) => (url ? h("a", { href: url, target: "_blank", rel: "noopener noreferrer", onclick: (e) => e.stopPropagation() }, text) : null);
+
+function drawerSection(title, ...kids) {
+  return h("section", { class: "d-sec" }, h("h4", {}, title), ...kids);
+}
+
+function openFinding(r) {
+  if (state.run) { state.run = null; writeHash(); }
+  const body = h("div", {},
+    h("div", { class: "d-badges" }, labelBadge(r), r.lab ? gtCell(r) : null),
+    drawerSection("Where", kv([["Endpoint", `${r.method} ${r.path}`], ["Target", r.target], ["Run", r.run_id], ["Run status", r.run_status]]),
+      r.run_id ? h("button", { class: "btn", onclick: () => openRun(r.run_id) }, "Open run") : null),
+    drawerSection("Probe", kv([["Identity", r.identity], ["Tenant", r.tenant], ["Role", r.role], ["Intent", r.intent], ["Probe id", r.probe_id]])),
+    drawerSection("Verdict", kv([["Label", r.label], ["Severity", r.severity], ["Judged", fmtWhen(r.judged_at)], ["Duplicate", r.is_duplicate ? "yes (Qdrant similarity hit)" : "no"], ["Verdict id", r.id]]),
+      linkTo(r.trace_link, "Judge trace in Langfuse ↗")),
+    drawerSection("Evidence", r.evidence_ref
+      ? kv([["Replayable pair", r.evidence_ref], ["Last status", r.status_code], ["Request", r.request_blob], ["Response", r.response_blob]])
+      : h("div", { class: "notice" }, statusIcon("critical"), h("span", {}, "No evidence_ref. No evidence, no report: this can't become a finding until the exchange is replayed and stored."))),
+    r.outcome ? drawerSection("Ground truth", h("p", { class: "small ink2" }, OUTCOME[r.outcome][2]), kv([["Lab", `${r.lab} (${r.twin} twin)`], ["Entry", r.gt_id], ["Category", r.gt_category]])) : null);
+  openDrawer(`Verdict ${r.id} · ${r.method} ${r.path}`, body);
+}
+
+async function openRun(id) {
+  state.run = id;
+  writeHash(); // shareable: #/eval?range=7d&run=<id>
+  openDrawer(`Run ${id}`, h("p", { class: "muted small", style: { padding: "16px" } }, "Loading…"));
+  let d;
+  try {
+    d = await api(`/api/run/${encodeURIComponent(id)}`);
+  } catch (e) {
+    openDrawer(`Run ${id}`, h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, e.message)));
+    return;
+  }
+  const r = d.run, sc = d.score;
+  const verdicts = d.verdicts;
+  const vc = (pred) => verdicts.filter(pred).length;
+  const body = h("div", {},
+    notices(d.notes),
+    h("div", { class: "tiles d-tiles" },
+      tile("Status", badge(r.status === "done" ? "good" : r.status === "running" ? "unknown" : "warning", r.status), fmtDur(r.started_at, r.ended_at)),
+      tile("LLM spend", fmtUSD(r.cost), `${fmtInt(r.calls)} calls`),
+      tile("Findings", fmtInt(r.findings), r.cost_per_finding ? `${fmtUSD(r.cost_per_finding)} each` : "unique, evidenced"),
+      sc && sc.recall != null ? tile("Recall", fmtPct(sc.recall), `${sc.hit} of ${sc.of} authz bugs`) : null,
+      sc ? tile("False positives", fmtInt(sc.counts.fp), `${sc.lab} ${sc.twin} twin`) : null),
+    drawerSection("Run", kv([["Target", r.target], ["Program", r.program], ["Started", fmtWhen(r.started_at)], ["Ended", r.ended_at ? fmtWhen(r.ended_at) : "—"]]),
+      linkTo(r.session_link, "Session in Langfuse ↗")),
+    drawerSection("Funnel", hbarList([
+      { label: "Operations", value: r.operations || 0 },
+      { label: "Probes", value: r.probes || 0 },
+      { label: "Executed", value: r.executed || 0 },
+      { label: "Interesting", value: r.interesting || 0 },
+      { label: "Judged", value: verdicts.length },
+      { label: "Confirmed", value: vc((v) => v.label === "confirmed") },
+      { label: "Findings", value: r.findings || 0 },
+    ])),
+    sc ? drawerSection(`Ground truth · ${sc.lab} (${sc.twin})`,
+      sc.missed?.length ? h("div", {}, h("p", { class: "small ink2" }, `Missed ${sc.missed.length}:`), h("ul", { class: "d-list" }, sc.missed.map((f) => h("li", {}, h("span", { class: "mono" }, f.id), h("span", { class: "muted" }, ` ${f.endpoint}`))))) : sc.of ? h("p", { class: "small ink2" }, "Every scorable authz bug found.") : null,
+      Object.keys(sc.fps).length ? h("div", {}, h("p", { class: "small ink2" }, "False positives:"), h("ul", { class: "d-list" }, Object.entries(sc.fps).map(([k, n]) => h("li", {}, h("span", { class: "mono" }, k), h("span", { class: "muted" }, ` ×${n}`))))) : h("p", { class: "small ink2" }, "No false positives."),
+      sc.unscorable?.length ? h("p", { class: "small muted" }, `Not auto-scorable (no fixed endpoint): ${sc.unscorable.map((f) => f.id).join(", ")}.`) : null) : null,
+    drawerSection("Spend by step", table([
+      { label: "Step", render: (x) => h("span", { class: "mono" }, x.name) },
+      { label: "Route", render: (x) => routeKey(x.route) },
+      { label: "Calls", key: "calls", fmt: fmtInt, align: "r" },
+      { label: "Tokens", key: "tokens", fmt: fmtInt, align: "r" },
+      { label: "Spend", key: "cost", fmt: fmtUSD, align: "r" },
+    ], d.steps, { empty: "No traced calls for this run (pass the run id as LiteLLM metadata session_id)." })),
+    drawerSection(`Verdicts (${verdicts.length})`, table([
+      { label: "Status", render: labelBadge },
+      { label: "Endpoint", render: endpoint },
+      { label: "Sev", render: sevCell },
+      { label: "Ground truth", render: gtCell },
+    ], verdicts, { onRow: openFinding, empty: "No verdicts.", cap: 25 })),
+    d.guardrails.length ? drawerSection("Guardrail events", table([
+      { label: "When", key: "t", fmt: fmtWhen, cls: "nw" },
+      { label: "Kind", key: "kind" },
+      { label: "Host", render: (x) => h("span", { class: "mono" }, x.host || "—") },
+      { label: "Detail", key: "detail", cls: "clip", title: (x) => x.detail || "" },
+    ], d.guardrails, { cap: 10 })) : null);
+  openDrawer(`Run ${id}`, body);
+}
+
+// ================================================================= FINDINGS
+
+const FILTERS = [
+  ["findings", "Findings", (r) => r.finding],
+  ["review", "Needs review", (r) => r.label === "needs_review"],
+  ["noevidence", "No evidence", (r) => r.label === "confirmed" && !r.evidence_ref],
+  ["dups", "Duplicates", (r) => r.label === "confirmed" && r.is_duplicate],
+  ["fp", "Lab false positives", (r) => r.outcome === "fp"],
+  ["unmatched", "Not in ground truth", (r) => r.outcome === "unmatched"],
+  ["all", "Everything", () => true],
+];
+
+const CSV_COLS = ["id", "judged_at", "label", "severity", "is_duplicate", "evidence_ref", "method", "path", "target", "run_id",
+  "identity", "tenant", "role", "intent", "status_code", "lab", "twin", "outcome", "gt_id", "trace_link"];
+function csv(rows, cols) {
+  const esc = (v) => {
+    let s = v == null ? "" : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // untrusted strings: don't let a spreadsheet run them as formulas
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return [cols.join(","), ...rows.map((r) => cols.map((c) => esc(r[c])).join(","))].join("\r\n");
+}
+function download(name, text, type) {
+  const a = h("a", { href: URL.createObjectURL(new Blob([text], { type })), download: name });
+  document.body.append(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+function renderFindings(d) {
+  const lede = h("p", { class: "lede" }, h("strong", {}, "What did the harness find? "), "Every confirmed and needs-review verdict, joined to its endpoint, probe identity, evidence and judge trace. On lab targets each one is checked against the ground truth.");
+  if (!d.available) return [lede, h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, d.error || "Findings DB unavailable."))];
+  const t = d.totals;
+  const tiles = h("div", { class: "tiles" },
+    tile("Findings", fmtInt(t.findings), `confirmed, evidenced, unique · ${RANGE_LABEL[d.range]}`, true),
+    tile("Needs review", fmtInt(t.needs_review), "judge unsure: human call"),
+    tile("No evidence", fmtInt(t.no_evidence), t.no_evidence ? "blocked by the evidence gate" : "evidence gate clean"),
+    tile("Duplicates", fmtInt(t.duplicates), "folded by Qdrant dedup"),
+    tile("Lab false positives", fmtInt(t.lab_fp), "against ground truth"),
+    tile("Not in ground truth", fmtInt(t.unmatched), "lab: novel or false"));
+
+  const sevRows = SEV_ORDER.filter((k) => d.severity[k]).map((k) => ({ label: k, value: d.severity[k], color: SEV_COLOR[k] }));
+  const sevCard = card("Findings by severity", "As the judge rated them.", sevRows.length ? hbarList(sevRows) : h("p", { class: "muted small" }, "No findings in this range."));
+
+  const byEp = new Map();
+  for (const r of d.rows.filter((x) => x.finding)) {
+    const k = `${r.method} ${r.path}`;
+    byEp.set(k, (byEp.get(k) || 0) + 1);
+  }
+  const epRows = [...byEp].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([label, value]) => ({ label, value }));
+  const epCard = card("Most-hit endpoints", "Findings per METHOD + path template.", epRows.length ? hbarList(epRows) : h("p", { class: "muted small" }, "No findings in this range."));
+
+  state.ffilter = state.ffilter || "findings";
+  const holder = h("div", {});
+  const search = h("input", { type: "search", class: "search", placeholder: "Filter by path, target, run, identity…", "aria-label": "Filter verdicts", value: state.fq || "" });
+  const chips = h("div", { class: "chips" });
+  const visible = () => {
+    const pred = (FILTERS.find((f) => f[0] === state.ffilter) || FILTERS[0])[2];
+    const q = (state.fq || "").toLowerCase().trim();
+    return d.rows.filter(pred).filter((r) => !q || [r.method, r.path, r.target, r.run_id, r.identity, r.tenant, r.role, r.intent, r.gt_id, r.severity].some((v) => v && String(v).toLowerCase().includes(q)));
+  };
+  const draw = () => {
+    chips.replaceChildren(...FILTERS.map(([k, label, pred]) => h("button", { class: "chip", "aria-pressed": String(state.ffilter === k), onclick: () => { state.ffilter = k; draw(); } }, `${label} · ${fmtInt(d.rows.filter(pred).length)}`)));
+    holder.replaceChildren(table([
+      { label: "Judged", key: "judged_at", fmt: fmtWhen, cls: "nw" },
+      { label: "Status", render: labelBadge },
+      { label: "Sev", render: sevCell },
+      { label: "Endpoint", render: endpoint },
+      { label: "Target", render: (r) => h("span", { class: "mono" }, r.target || "—") },
+      { label: "As", render: (r) => [r.identity, r.role, r.tenant].filter(Boolean).join(" · ") || "—", cls: "nw" },
+      { label: "Intent", key: "intent", cls: "clip", title: (r) => r.intent || "" },
+      { label: "Ground truth", render: gtCell },
+      { label: "", cls: "nw", render: (r) => linkTo(r.trace_link, "Trace ↗") || "—" },
+    ], visible(), { onRow: openFinding, empty: "No verdicts match.", cap: 50 }));
+  };
+  search.addEventListener("input", () => { state.fq = search.value; draw(); });
+  draw();
+  const exportBtn = h("button", { class: "btn", onclick: () => download(`harness-verdicts-${d.range}.csv`,
+    csv(visible().map((r) => ({ ...r, judged_at: r.judged_at ? new Date(r.judged_at * 1000).toISOString() : "" })), CSV_COLS), "text/csv") }, "Export CSV");
+
+  const list = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("div", {}, h("h3", {}, "Verdicts"), h("p", { class: "sub" }, "Newest first. Click a row for the probe, evidence refs, ground-truth match and run.")), h("div", { class: "actions" }, exportBtn)),
+    h("div", { class: "toolbar" }, search), chips, holder);
+  return [lede, tiles, h("div", { class: "stack" }, h("div", { class: "grid g2" }, sevCard, epCard), list)];
+}
+
+// ================================================================= EVAL
+
+function matrix(t) {
+  const cols = [...t.columns].reverse(); // oldest → newest, left → right
+  const rows = [
+    ...t.findings.filter((f) => f.scope === "authz").map((f) => ({ ...f, group: "authz" })),
+    ...t.findings.filter((f) => f.scope !== "authz").map((f) => ({ ...f, group: "other" })),
+    ...t.negatives.map((f) => ({ ...f, group: "negative" })),
+  ];
+  const cell = (f, c) => {
+    if (c.found[f.id]) return h("td", { class: "mx good", title: `${c.id}: confirmed ×${c.found[f.id]}` }, "✓");
+    if (c.fps[f.id]) return h("td", { class: "mx bad", title: `${c.id}: false positive ×${c.fps[f.id]}` }, "✗");
+    if (f.group === "negative" || (c.twin === "control" && f.gated)) return h("td", { class: "mx na", title: "should stay clean" }, "·");
+    if (!f.matchable) return h("td", { class: "mx na", title: "not auto-scorable" }, "?");
+    return h("td", { class: "mx " + (f.group === "authz" ? "miss" : "na"), title: `${c.id}: not found` }, f.group === "authz" ? "○" : "·");
+  };
+  const unmatched = (c) => c.counts.unmatched + Object.keys(c.fps).filter((k) => !rows.some((r) => r.id === k)).reduce((a, k) => a + c.fps[k], 0);
+  return h("div", { class: "table-wrap" }, h("table", { class: "data matrix" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Ground truth"), cols.map((c) => h("th", { class: "mx-h" },
+      h("button", { class: "link-btn", title: `${c.id} · ${c.twin} twin · ${fmtWhen(c.started_at)}`, onclick: () => openRun(c.id) }, df.format(new Date((c.started_at || 0) * 1000)), c.twin === "control" ? h("span", { class: "tag" }, "ctl") : null))))),
+    h("tbody", {},
+      rows.map((f) => h("tr", { class: f.group === "authz" ? "" : "muted-row" },
+        h("td", { class: "nw" }, h("span", { class: "mono" }, f.group === "negative" ? f.endpoint : f.id), f.group !== "authz" ? h("span", { class: "tag" }, f.group === "negative" ? "negative" : "other") : null, !f.matchable && f.group !== "negative" ? h("span", { class: "tag" }, "manual") : null),
+        cols.map((c) => cell(f, c)))),
+      h("tr", { class: "muted-row" }, h("td", {}, "Unmatched / other FPs"), cols.map((c) => { const n = unmatched(c); return h("td", { class: "mx " + (n ? (c.twin === "control" ? "bad" : "warn") : "na") }, n ? String(n) : "·"); })))));
+}
+
+function renderEval(d) {
+  const lede = h("p", { class: "lede" }, h("strong", {}, "Is the harness actually right? "), "Runs against the offline lab scored on the ground truth in ", h("code", {}, "lab/ground-truth/"), ": recall on authz bugs, false positives on negatives and VAmPI's secure twin, and cost per confirmed bug. Re-run after every prompt, model or router change.");
+  if (!d.available) {
+    return [lede, h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, d.error || "Unavailable.")),
+      ...(d.errors || []).map((e) => h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, e)))];
+  }
+  const out = [lede, notices(d.notes), ...(d.errors || []).map((e) => h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, `Ground truth: ${e}`)))];
+  const cards = d.targets.map((t) => {
+    const L = t.latest;
+    const head = h("div", { class: "card-head" }, h("div", {}, h("h3", {}, t.name), h("p", { class: "sub mono" }, [t.source, t.base_url, t.control_url ? `control ${t.control_url}` : null].filter(Boolean).join(" · "))),
+      h("div", { class: "actions" }, h("span", { class: "muted small" }, `${t.scorable} of ${t.authz} authz bugs auto-scorable`)));
+    if (!t.runs) {
+      return h("div", { class: "card" }, head, h("p", { class: "muted small" }, `No runs against ${t.name} in this range. Write harness.runs.target as its base URL (e.g. ${t.base_url}) or a name like "${t.name}"${t.control_url ? ` / "${t.name}-control"` : ""}.`));
+    }
+    // The orchestrator replays each probe on the secure twin inside the same run; that
+    // control result lives in the evidence file, not the DB, so only separate control runs count here.
+    const fpHint = t.latest_control ? "latest run + latest control run"
+      : t.control_url ? "latest run · in-run twin checks are in its evidence files" : "latest run";
+    const tiles = h("div", { class: "tiles" },
+      tile("Recall", L?.recall == null ? "—" : fmtPct(L.recall), L ? `${L.hit} of ${L.of} authz bugs · latest run` : "no finished run", true),
+      tile("False positives", t.fp_latest == null ? "—" : fmtInt(t.fp_latest), fpHint),
+      tile("Cost per confirmed bug", fmtUSD(t.cost_per_bug), `${RANGE_LABEL[d.range]}`),
+      tile("Runs scored", fmtInt(t.runs), t.control_url ? "vulnerable + control" : "vulnerable"));
+    const series = t.recall_series.filter((x) => x.recall != null);
+    const chart = series.length > 1 ? chartCard({
+      title: "Recall per run", sub: "Vulnerable twin, oldest to newest. Hover for the run.",
+      draw: (el) => lines(el, { buckets: series.map((x) => x.t), series: [{ name: "Recall", color: "var(--s3)", values: series.map((x) => x.recall) }], fmt: (v) => fmtPct(v), fmtX: (x) => df.format(new Date(x * 1000)), titleX: (x) => fmtWhen(x), label: `${t.name} recall per run`, height: 160 }),
+      tableView: () => table([{ label: "Run", render: (x) => h("span", { class: "mono" }, x.id) }, { label: "Started", key: "t", fmt: fmtWhen }, { label: "Recall", key: "recall", fmt: (v) => fmtPct(v), align: "r" }], [...series].reverse(), { onRow: (x) => openRun(x.id) }),
+    }) : null;
+    return h("div", { class: "card" }, head, tiles,
+      chart ? h("div", { class: "eval-chart" }, chart) : null,
+      h("h4", { class: "mx-title" }, "Coverage, last ", String(t.columns.length), " runs"),
+      h("p", { class: "sub small muted" }, "✓ found · ○ missed authz bug · ✗ false positive · · should stay clean / not counted · ? needs manual scoring. Click a date to open the run."),
+      matrix(t));
+  });
+
+  const runsCard = card("Scored runs", "Every lab run in range. Recall counts distinct authz bugs; spend comes from the run's Langfuse session.",
+    table([
+      { label: "Run", render: (r) => h("span", { class: "mono" }, r.id) },
+      { label: "Lab", render: (r) => [r.lab, r.twin === "control" ? h("span", { class: "tag" }, "control") : null] },
+      { label: "Started", key: "started_at", fmt: fmtWhen, cls: "nw" },
+      { label: "Recall", align: "r", render: (r) => (r.recall == null ? "—" : h("span", {}, `${fmtPct(r.recall)} `, h("span", { class: "inline-bar", style: { width: `${Math.round(48 * r.recall)}px`, background: "var(--s3)" } }))) },
+      { label: "TP", align: "r", render: (r) => fmtInt(r.counts.tp) },
+      { label: "FP", align: "r", render: (r) => (r.counts.fp ? h("span", { class: "error" }, fmtInt(r.counts.fp)) : "0") },
+      { label: "Other", align: "r", render: (r) => fmtInt(r.counts.other) },
+      { label: "Unmatched", align: "r", render: (r) => fmtInt(r.counts.unmatched) },
+      { label: "Spend", key: "cost", fmt: fmtUSD, align: "r" },
+      { label: "Per bug", key: "cost_per_bug", fmt: fmtUSD, align: "r" },
+    ], d.runs, { onRow: (r) => openRun(r.id), empty: "No lab runs in this range.", cap: 15 }));
+  out.push(h("div", { class: "stack" }, ...cards, runsCard));
+  return out;
 }
 
 // ================================================================= RAW
@@ -519,9 +796,12 @@ const SQL_EXAMPLES = [
 
 function openDrawer(title, obj) {
   $("#drawer-title").textContent = title;
-  $("#drawer-body").textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+  const body = $("#drawer-body");
+  body.scrollTop = 0;
+  body.replaceChildren(obj instanceof Node ? obj : h("pre", {}, typeof obj === "string" ? obj : JSON.stringify(obj, null, 2)));
+  const wasOpen = !$("#drawer").hidden;
   $("#drawer").hidden = false;
-  $("#drawer-close").focus();
+  if (!wasOpen) $("#drawer-close").focus();
 }
 
 function pager(page, pages, go, more) {
@@ -659,6 +939,8 @@ async function render() {
     if (state.tab === "health") nodes = renderHealth(await api("/api/health"));
     else if (state.tab === "trends") nodes = renderTrends(await api(`/api/trends?range=${state.range}`));
     else if (state.tab === "flows") nodes = renderFlows(await api(`/api/flows?range=${state.range}`));
+    else if (state.tab === "findings") nodes = renderFindings(await api(`/api/findings?range=${state.range}`));
+    else if (state.tab === "eval") nodes = renderEval(await api(`/api/eval?range=${state.range}`));
     else nodes = await renderRaw();
     if (my !== seq) return;
     for (const el of sec.querySelectorAll(".chart")) { ro.unobserve(el); drawers.delete(el); }
@@ -675,7 +957,9 @@ async function render() {
 
 function schedule() {
   clearInterval(state.timer);
-  if ($("#auto").checked) state.timer = setInterval(() => { if (state.tab !== "raw" && document.visibilityState === "visible") render(); }, 30000);
+  // skip a tick while someone is typing in a filter box, or the redraw steals focus
+  const typing = () => document.activeElement?.matches?.("#main input, #main textarea");
+  if ($("#auto").checked) state.timer = setInterval(() => { if (state.tab !== "raw" && document.visibilityState === "visible" && !typing()) render(); }, 30000);
 }
 
 async function init() {
@@ -694,12 +978,14 @@ async function init() {
   }
   $("#refresh").addEventListener("click", render);
   $("#auto").addEventListener("change", schedule);
-  $("#drawer-close").addEventListener("click", () => { $("#drawer").hidden = true; });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("#drawer").hidden = true; });
+  const closeDrawer = () => { $("#drawer").hidden = true; if (state.run) { state.run = null; writeHash(); } };
+  $("#drawer-close").addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
   window.addEventListener("hashchange", () => { readHash(); render(); });
   writeHash();
   schedule();
   render();
+  if (state.run) openRun(state.run);
 }
 
 init();

@@ -167,7 +167,13 @@ services:
       PROBE_REDIS: redis:6379
       PROBE_MINIO: http://minio:9000
       LITELLM_CONFIG: /app/litellm.config.yaml
-    volumes: ["./litellm.config.yaml:/app/litellm.config.yaml:ro"]
+      # Eval tab: lab ground truth (re-read on change) + the IP its base_urls use
+      LAB_GROUND_TRUTH: /app/lab-ground-truth
+      TAILNET_IP: ${TAILNET_IP:-127.0.0.1}
+      DASHBOARD_BUDGET_24H_USD: ${DASHBOARD_BUDGET_24H_USD:-}
+    volumes:
+      - ./litellm.config.yaml:/app/litellm.config.yaml:ro
+      - ./lab/ground-truth:/app/lab-ground-truth:ro
     extra_hosts: ["host.docker.internal:host-gateway"]
 
 volumes:

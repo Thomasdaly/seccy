@@ -27,6 +27,8 @@ import yaml
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from lab import LabIndex
+
 log = logging.getLogger("dashboard")
 
 # Fixed route order = fixed colour slot per route (colour follows the entity).
@@ -53,6 +55,7 @@ USAGE_METRICS = [("count", "count"), ("totalTokens", "sum"), ("totalCost", "sum"
 GRANULARITY = {3600: "hour", 86400: "day", 7 * 86400: "week"}
 PIPELINE = ["langfuse-worker", "clickhouse", "redis", "minio"]  # Langfuse v4 backing services
 HISTORY_SAMPLES = 2880  # 24h at 30s
+DEFAULT_LAB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "lab", "ground-truth")
 POLL_SECONDS = 30
 
 
@@ -239,7 +242,7 @@ select r.id, r.target, r.program, r.status,
      where o.run_id = r.id and v.label = 'confirmed' and v.evidence_ref is not null
        and not v.is_duplicate) as findings
 from harness.runs r where r.started_at >= %(since)s
-order by r.started_at desc limit 50
+order by r.started_at desc limit %(limit)s
 """
 
 FINDINGS_TS_SQL = """
@@ -262,6 +265,46 @@ KILL_SQL = """
 select detail, extract(epoch from ts)::float as t from harness.guardrail_events
 where kind = 'kill_switch' order by ts desc limit 1
 """
+
+
+# Confirmed + needs-review verdicts with their operation, probe, run and latest exchange.
+VERDICTS_SQL = """
+select v.id, extract(epoch from v.judged_at)::float as judged_at, v.label, v.severity, v.is_duplicate,
+  v.evidence_ref, v.trace_id, o.run_id, r.target, r.status as run_status, o.method, o.path,
+  p.id as probe_id, p.identity, p.tenant, p.role, p.intent,
+  e.status_code, e.request_blob, e.response_blob
+from harness.verdicts v
+join harness.probes p on p.id = v.probe_id
+join harness.operations o on o.id = p.op_id
+left join harness.runs r on r.id = o.run_id
+left join lateral (select x.status_code, x.request_blob, x.response_blob from harness.exchanges x
+                   where x.probe_id = p.id order by x.id desc limit 1) e on true
+where {where}
+order by v.judged_at desc limit 5000
+"""
+
+RUN_SQL = """
+select r.id, r.target, r.program, r.status,
+  extract(epoch from r.started_at)::float as started_at,
+  extract(epoch from r.ended_at)::float as ended_at,
+  (select count(*) from harness.operations o where o.run_id = r.id) as operations,
+  (select count(*) from harness.probes p join harness.operations o on o.id = p.op_id where o.run_id = r.id) as probes,
+  (select count(*) from harness.probes p join harness.operations o on o.id = p.op_id
+     where o.run_id = r.id and p.interesting) as interesting,
+  (select count(distinct e.probe_id) from harness.exchanges e join harness.probes p on p.id = e.probe_id
+     join harness.operations o on o.id = p.op_id where o.run_id = r.id) as executed
+from harness.runs r where r.id = %(id)s
+"""
+
+RUN_GUARD_SQL = """
+select extract(epoch from ts)::float as t, kind, host, detail from harness.guardrail_events
+where run_id = %(id)s order by ts desc limit 200
+"""
+
+
+def finding_key(v: dict) -> bool:
+    """A finding is confirmed + evidenced + not a duplicate (db/harness.sql contract)."""
+    return v.get("label") == "confirmed" and bool(v.get("evidence_ref")) and not v.get("is_duplicate")
 
 
 # --------------------------------------------------------------------------- backend
@@ -287,6 +330,11 @@ class Backend:
         self.cache = TTLCache()
         self.history: dict[str, deque] = defaultdict(lambda: deque(maxlen=HISTORY_SAMPLES))
         self.snapshot: dict | None = None
+        self.budget_24h = opt_num(_env("DASHBOARD_BUDGET_24H_USD") or None)
+        self.lab_dir = _env("LAB_GROUND_TRUTH", DEFAULT_LAB_DIR)
+        self.tailnet_ip = _env("TAILNET_IP")
+        self._lab: LabIndex | None = None
+        self._lab_stamp: tuple | None = None
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -302,7 +350,20 @@ class Backend:
             "langfuse_project": self.lf_project,
             "routes": self.route_order(),
             "ranges": list(RANGES),
+            "lab_targets": sorted(self.lab.targets),
         }
+
+    @property
+    def lab(self) -> LabIndex:
+        """Ground truth, re-read when a file under LAB_GROUND_TRUTH changes."""
+        try:
+            stamp = tuple(sorted((e.name, e.stat().st_mtime) for e in os.scandir(self.lab_dir)
+                                 if e.name.endswith((".yaml", ".yml"))))
+        except OSError:
+            stamp = ()
+        if self._lab is None or stamp != self._lab_stamp:
+            self._lab, self._lab_stamp = LabIndex(self.lab_dir if stamp else None, self.tailnet_ip), stamp
+        return self._lab
 
     # ---- routes / tiers ------------------------------------------------------
 
@@ -629,6 +690,19 @@ class Backend:
         except Exception as e:  # noqa: BLE001 - a failed check shouldn't break /health
             out.append({"id": "tiers", "label": "Tier discipline (7d)", "status": "unknown", "value": "—", "detail": str(e)[:200]})
 
+        if self.budget_24h:
+            spent = ((by.get("langfuse") or {}).get("detail") or {}).get("cost_24h")
+            if spent is None:
+                out.append({"id": "budget", "label": "LLM spend vs budget (24h)", "status": "unknown", "value": "—",
+                            "detail": "Langfuse spend unavailable."})
+            else:
+                frac = spent / self.budget_24h
+                out.append({"id": "budget", "label": "LLM spend vs budget (24h)",
+                            "status": "good" if frac < 0.8 else ("warning" if frac <= 1 else "critical"),
+                            "value": f"${spent:,.2f} of ${self.budget_24h:,.2f}",
+                            "detail": f"{frac:.0%} of DASHBOARD_BUDGET_24H_USD used in the last 24 hours."
+                            + (" Over budget: consider engaging the kill switch." if frac > 1 else "")})
+
         fp = disk.get("free_pct", 100)
         out.append({"id": "disk", "label": "Disk free (docker volumes)", "status": "good" if fp > 20 else ("warning" if fp > 10 else "critical"),
                     "value": f"{fp:.0f}% free", "detail": "Postgres, Qdrant and Langfuse volumes live on the WSL2 disk."})
@@ -753,7 +827,7 @@ class Backend:
                     guard_ts = [(r["t"], r["kind"]) for r in await rows(GUARD_TS_SQL)]
                     recent = await rows(GUARD_RECENT_SQL)
                     kill = await rows(KILL_SQL, None)
-                    runs = await rows(RUNS_SQL)
+                    runs = await rows(RUNS_SQL, {**p, "limit": 50})
             except psycopg.Error as e:
                 return {"available": False, "error": f"Postgres: {str(e).strip()[:200]}"}
             return {
@@ -884,6 +958,130 @@ class Backend:
         return await self.cache.get(("flows", rng, make_buckets(rng)[0][0]), 30, build)
 
         # ---- raw -----------------------------------------------------------------
+
+    # ---- findings / eval / run detail ----------------------------------------
+
+    async def verdict_rows(self, since: float | None = None, run_id: str | None = None) -> list[dict]:
+        """Verdicts joined to op/probe/run/exchange. By judged_at range, or every label for one run."""
+        async def fetch():
+            if not self.db_url:
+                raise ValueError("DASHBOARD_DATABASE_URL not set")
+            if run_id is not None:
+                where, params = "o.run_id = %(id)s", {"id": run_id}
+            else:
+                where = "v.judged_at >= %(since)s and v.label in ('confirmed', 'needs_review')"
+                params = {"since": datetime.fromtimestamp(since or 0, timezone.utc)}
+            async with await self._db() as c:
+                return await (await c.execute(VERDICTS_SQL.format(where=where), params)).fetchall()
+        return await self.cache.get(("verdicts", since, run_id), 30, fetch)
+
+    def _with_lab(self, rows: list[dict]) -> list[dict]:
+        lab = self.lab
+        out = []
+        for v in rows:
+            gt = lab.annotate(v)
+            if v.get("label") != "confirmed":  # only confirmed verdicts are scored
+                gt = {"lab": gt["lab"], "twin": gt.get("twin")}
+            out.append({**clean(v, 600), "finding": finding_key(v), "trace_link": self._lf_link(v.get("trace_id")), **gt})
+        return out
+
+    async def findings(self, rng: str) -> dict:
+        since = make_buckets(rng)[0][0]
+        h = await self.harness(since)
+        if not h.get("available"):
+            return {"available": False, "error": h.get("error"), "rows": []}
+        rows = self._with_lab(await self.verdict_rows(since))
+        conf = [r for r in rows if r["label"] == "confirmed"]
+        sev = Counter((r.get("severity") or "unrated").lower() for r in conf if r["finding"])
+        return {
+            "available": True, "range": rng, "rows": rows,
+            "totals": {"findings": sum(1 for r in conf if r["finding"]), "needs_review": sum(1 for r in rows if r["label"] == "needs_review"),
+                       "no_evidence": sum(1 for r in conf if not r.get("evidence_ref")),
+                       "duplicates": sum(1 for r in conf if r.get("is_duplicate")),
+                       "lab_fp": sum(1 for r in conf if r.get("outcome") == "fp"),
+                       "unmatched": sum(1 for r in conf if r.get("outcome") == "unmatched")},
+            "severity": dict(sev),
+        }
+
+    async def eval_scores(self, rng: str) -> dict:
+        lab = self.lab
+        if not lab.targets:
+            return {"available": False, "dir": self.lab_dir, "errors": lab.errors,
+                    "error": f"No ground truth found in {self.lab_dir}. Mount lab/ground-truth there (docker-compose.yml does) or set LAB_GROUND_TRUTH."}
+        since = make_buckets(rng)[0][0]
+        fl = await self.flows(rng)
+        h = fl["harness"]
+        if not h.get("available"):
+            return {"available": False, "error": h.get("error"), "targets": [t.summary() for t in lab.targets.values()]}
+        spend = {r["id"]: r for r in fl["runs"]}
+        try:
+            for srow in await self.session_rows(since, time.time()):
+                spend.setdefault(srow["session_id"], {"cost": srow["cost"], "calls": srow["calls"]})
+        except Exception:  # noqa: BLE001 - flows already noted Langfuse trouble
+            pass
+        runs = [{**r, "cost": (spend.get(r["id"]) or {}).get("cost", 0.0), "calls": (spend.get(r["id"]) or {}).get("calls")}
+                for r in await self.run_rows(since, 1000)]
+        verdicts = [v for v in await self.verdict_rows(since) if v["label"] == "confirmed" and v.get("evidence_ref")]
+        out = lab.score(runs, verdicts)
+        return {**out, "range": rng, "notes": fl["notes"]}
+
+    async def run_rows(self, since: float, limit: int) -> list[dict]:
+        async def fetch():
+            async with await self._db() as c:
+                return await (await c.execute(RUNS_SQL, {"since": datetime.fromtimestamp(since, timezone.utc), "limit": limit})).fetchall()
+        return await self.cache.get(("run_rows", since, limit), 30, fetch)
+
+    async def run_step_rows(self, run_id: str, since: float, until: float) -> list[dict]:
+        rows = await self.lf_metrics(since, until, ["name", "providedModelName"], [("count", "count"), ("totalCost", "sum"), ("totalTokens", "sum")],
+                                     filters=[{"column": "sessionId", "operator": "=", "value": run_id, "type": "string"}])
+        return [{"name": r.get("name") or "(unnamed)", "route": self.route_of(r.get("providedModelName")),
+                 "calls": num(r.get("count_count")), "cost": num(r.get("sum_totalCost")), "tokens": num(r.get("sum_totalTokens"))}
+                for r in rows]
+
+    async def run_row(self, run_id: str) -> tuple[dict | None, list[dict]]:
+        if not self.db_url:
+            raise ValueError("DASHBOARD_DATABASE_URL not set")
+        async with await self._db() as c:
+            run = await (await c.execute(RUN_SQL, {"id": run_id})).fetchone()
+            guards = await (await c.execute(RUN_GUARD_SQL, {"id": run_id})).fetchall() if run else []
+        return run, guards
+
+    async def run_detail(self, run_id: str) -> dict:
+        run, guards = await self.run_row(run_id)
+        if not run:
+            raise ValueError(f"no harness run {run_id!r}")
+        notes: list[str] = []
+        steps: list[dict] = []
+        start, end = run["started_at"] or 0, run["ended_at"] or time.time()
+        try:
+            agg: dict[str, dict] = {}
+            for r in await self.run_step_rows(run_id, start - 300, end + 300):
+                a = agg.setdefault(r["name"], {"name": r["name"], "route": r["route"], "calls": 0.0, "cost": 0.0, "tokens": 0.0})
+                for k in ("calls", "cost", "tokens"):
+                    a[k] += r[k]
+            steps = sorted(agg.values(), key=lambda x: -x["cost"])
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"Per-step spend unavailable: {err_text(e)}")
+        verdicts = self._with_lab(await self.verdict_rows(run_id=run_id))
+        cost = sum(s["cost"] for s in steps)
+        lab_t, twin = self.lab.target_of(run.get("target"))
+        score = None
+        if lab_t:
+            conf = [v for v in verdicts if v["label"] == "confirmed" and v.get("evidence_ref")]
+            res = self.lab.score([{**run, "cost": cost}], conf)
+            score = res["runs"][0] if res["runs"] else None
+            if score:
+                gt = lab_t.summary()
+                score["missed"] = [f for f in lab_t.denominator if f["id"] not in score["found"]
+                                   and (twin == "vulnerable" or not f["gated"])]
+                score["unscorable"] = [f for f in gt["findings"] if f["scope"] == "authz" and not f["matchable"]]
+        findings = sum(1 for v in verdicts if v["finding"])
+        return {
+            "run": {**clean(run), "cost": cost, "calls": sum(s["calls"] for s in steps), "findings": findings,
+                    "cost_per_finding": (cost / findings) if findings and cost else None,
+                    "session_link": f"{self.langfuse_ui}/project/{self.lf_project}/sessions/{quote(run_id, safe='')}"},
+            "verdicts": verdicts, "steps": steps, "guardrails": guards, "score": score, "notes": notes,
+        }
 
     def _lf_link(self, trace_id: str | None) -> str | None:
         return f"{self.langfuse_ui}/project/{self.lf_project}/traces/{trace_id}" if trace_id else None

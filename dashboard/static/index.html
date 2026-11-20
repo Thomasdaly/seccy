@@ -17,6 +17,8 @@
       <button role="tab" data-tab="health">Health</button>
       <button role="tab" data-tab="trends">Trends</button>
       <button role="tab" data-tab="flows">Flows</button>
+      <button role="tab" data-tab="findings">Findings</button>
+      <button role="tab" data-tab="eval">Eval</button>
       <button role="tab" data-tab="raw">Raw</button>
     </nav>
     <div class="top-right">
@@ -36,12 +38,14 @@
     <section id="tab-health" class="tab" role="tabpanel" hidden></section>
     <section id="tab-trends" class="tab" role="tabpanel" hidden></section>
     <section id="tab-flows" class="tab" role="tabpanel" hidden></section>
+    <section id="tab-findings" class="tab" role="tabpanel" hidden></section>
+    <section id="tab-eval" class="tab" role="tabpanel" hidden></section>
     <section id="tab-raw" class="tab" role="tabpanel" hidden></section>
   </main>
   <div id="tooltip" class="tooltip" hidden></div>
   <aside id="drawer" class="drawer" hidden aria-label="Record detail">
     <header><h3 id="drawer-title"></h3><button id="drawer-close" class="btn">Close</button></header>
-    <pre id="drawer-body"></pre>
+    <div id="drawer-body" class="drawer-body"></div>
   </aside>
   <script type="module" src="app.js"></script>
 </body>

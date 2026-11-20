@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 import psycopg
 from fastapi import Body, FastAPI, Query, Request
+from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -114,6 +115,21 @@ async def trends(range: str = Range):  # noqa: A002 - query param name
 @app.get("/api/flows")
 async def flows(range: str = Range):  # noqa: A002
     return await backend.flows(range)
+
+
+@app.get("/api/findings")
+async def findings(range: str = Range):  # noqa: A002
+    return await backend.findings(range)
+
+
+@app.get("/api/eval")
+async def eval_scores(range: str = Range):  # noqa: A002
+    return await backend.eval_scores(range)
+
+
+@app.get("/api/run/{run_id}")
+async def run_detail(run_id: str = PathParam(..., max_length=200)):
+    return await backend.run_detail(run_id)
 
 
 @app.post("/api/probe-routes")
