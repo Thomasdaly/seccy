@@ -79,7 +79,7 @@ function frame(el, o = {}) {
   el.replaceChildren();
   const W = Math.max(260, Math.round(el.clientWidth || 600));
   const H = o.height || 200;
-  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": o.label || "chart" }, el);
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": o.label || "Chart" }, el);
   return { el, svg, W, H, x0: o.left ?? 52, x1: W - (o.right ?? 12), y0: o.top ?? 8, y1: H - (o.bottom ?? 24) };
 }
 
@@ -128,6 +128,7 @@ export function columns(el, opt) {
   const totals = buckets.map((_, i) => series.reduce((a, sr) => a + (sr.values[i] || 0), 0));
   const maxT = Math.max(0, ...totals);
   if (!(maxT > 0)) return empty(f, opt.emptyText || "No data in this range");
+  f.svg.setAttribute("role", "group");
   const { max, step } = niceMax(maxT);
   const Y = yAxis(f, max, step, fmt);
   const band = (f.x1 - f.x0) / n;
@@ -152,11 +153,14 @@ export function columns(el, opt) {
     });
   }
   xLabels(f, buckets, X, fmtX);
+  const hits = [];
   for (let i = 0; i < n; i++) {
     const hit = s("rect", {
-      class: "hit", x: f.x0 + band * i, y: f.y0, width: band, height: f.y1 - f.y0 + 20, tabindex: 0,
-      "aria-label": `${titleX(buckets[i])}: ${fmt(totals[i])}`,
+      class: "hit", x: f.x0 + band * i, y: f.y0, width: band, height: f.y1 - f.y0 + 20,
+      role: "img", tabindex: i === n - 1 ? 0 : -1,
+      "aria-label": `${titleX(buckets[i])}: ${series.map((sr) => `${sr.name} ${fmt(sr.values[i] || 0)}`).join(", ")}`,
     }, f.svg);
+    hits.push(hit);
     const show = (e) => {
       hover.setAttribute("x", f.x0 + band * i);
       hover.setAttribute("visibility", "visible");
@@ -169,6 +173,15 @@ export function columns(el, opt) {
     hit.addEventListener("focus", show);
     hit.addEventListener("pointerleave", hide);
     hit.addEventListener("blur", hide);
+    hit.addEventListener("keydown", (e) => {
+      const targets = { ArrowLeft: Math.max(0, i - 1), ArrowRight: Math.min(n - 1, i + 1), Home: 0, End: n - 1 };
+      if (!Object.hasOwn(targets, e.key)) return;
+      e.preventDefault();
+      hit.setAttribute("tabindex", -1);
+      const next = hits[targets[e.key]];
+      next.setAttribute("tabindex", 0);
+      next.focus();
+    });
   }
 }
 
@@ -181,6 +194,7 @@ export function lines(el, opt) {
   const n = buckets.length;
   const all = series.flatMap((sr) => sr.values.filter((v) => v != null));
   if (!all.length) return empty(f, opt.emptyText || "No data in this range");
+  f.svg.setAttribute("role", "group");
   const { max, step } = niceMax(Math.max(...all));
   const Y = yAxis(f, max, step, fmt);
   const X = (i) => (n === 1 ? (f.x0 + f.x1) / 2 : f.x0 + ((f.x1 - f.x0) * i) / (n - 1));
@@ -203,7 +217,8 @@ export function lines(el, opt) {
   }
   xLabels(f, buckets, X, fmtX);
   const dots = series.map((sr) => s("circle", { r: 4, visibility: "hidden", style: { fill: sr.color, stroke: "var(--surface)", strokeWidth: 2, pointerEvents: "none" } }, f.svg));
-  const hit = s("rect", { class: "hit", x: f.x0 - 6, y: f.y0, width: f.x1 - f.x0 + 12, height: f.y1 - f.y0 + 20, tabindex: 0, "aria-label": opt.label || "line chart; use arrow keys" }, f.svg);
+  const hit = s("rect", { class: "hit", x: f.x0 - 6, y: f.y0, width: f.x1 - f.x0 + 12, height: f.y1 - f.y0 + 20,
+    role: "img", tabindex: 0, "aria-label": `${opt.label || "Line chart"}. Use left and right arrow keys to explore values.` }, f.svg);
   let cur = n - 1;
   const showAt = (i, e) => {
     cur = Math.max(0, Math.min(n - 1, i));
@@ -215,6 +230,7 @@ export function lines(el, opt) {
       dots[k].setAttribute("cx", x); dots[k].setAttribute("cy", Y(v)); dots[k].setAttribute("visibility", "visible");
     });
     const rows = series.map((sr) => ({ kind: "line", color: sr.color, value: sr.values[cur] == null ? "—" : fmt(sr.values[cur]), label: sr.name }));
+    hit.setAttribute("aria-label", `${titleX(buckets[cur])}: ${rows.map((row) => `${row.label} ${row.value}`).join(", ")}`);
     showTip(e, titleX(buckets[cur]), rows);
   };
   const hide = () => { cross.setAttribute("visibility", "hidden"); dots.forEach((d) => d.setAttribute("visibility", "hidden")); hideTip(); };
@@ -288,14 +304,11 @@ export function flowRows(el, opt) {
       const p = L.pos[k.key];
       if (!p || p.w <= 0) continue;
       const r = s("rect", {
-        x: p.x, y: L.y, width: Math.max(1, p.w), height: barH, rx: Math.min(4, p.w / 2), tabindex: 0,
-        "aria-label": `${row.title}, ${k.name}: ${row.fmt(row.values[k.key])} (${Math.round(p.share * 100)}%)`,
+        x: p.x, y: L.y, width: Math.max(1, p.w), height: barH, rx: Math.min(4, p.w / 2),
         style: { fill: k.color, cursor: "default" },
       }, f.svg);
       r.addEventListener("pointermove", tipFor(k));
-      r.addEventListener("focus", tipFor(k));
       r.addEventListener("pointerleave", hideTip);
-      r.addEventListener("blur", hideTip);
       const label = `${Math.round(p.share * 100)}%`;
       if (p.w >= label.length * 7 + 14) {
         s("text", { x: p.x + 8, y: L.y + barH / 2, dy: "0.32em", text: label, style: { fill: k.ink, fontWeight: 600, pointerEvents: "none" } }, f.svg);

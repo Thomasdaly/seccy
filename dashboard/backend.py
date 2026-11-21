@@ -25,7 +25,8 @@ import httpx
 import psycopg
 import yaml
 from psycopg import sql
-from psycopg.rows import dict_row
+from psycopg.conninfo import make_conninfo
+from psycopg.rows import dict_row, tuple_row
 
 from lab import LabIndex
 
@@ -87,12 +88,10 @@ def num(v: Any) -> float:
 
 
 def err_text(e: Exception) -> str:
-    """Short upstream error: status + path, never the full URL with query strings."""
+    """Write diagnostics without forwarding upstream text or URLs."""
     if isinstance(e, httpx.HTTPStatusError):
-        code = e.response.status_code
-        hint = " (check Langfuse API keys)" if code == 401 else ""
-        return f"HTTP {code} from {e.request.url.path}{hint}"
-    return f"{type(e).__name__}: {str(e).strip().splitlines()[0][:160] if str(e).strip() else ''}"
+        return f"Upstream responded with HTTP {e.response.status_code}"
+    return type(e).__name__
 
 
 def opt_num(v: Any) -> float | None:
@@ -142,27 +141,6 @@ def clean(v: Any, limit: int = 4000) -> Any:
     return str(v)
 
 
-def preview(v: Any, n: int = 160) -> str:
-    """One-line preview of a chat input/output for table cells."""
-    if v is None:
-        return ""
-    if isinstance(v, str) and v[:1] in "[{":
-        try:  # v2 observations return input/output as raw JSON strings
-            v = json.loads(v)
-        except ValueError:
-            pass
-    if isinstance(v, dict):
-        if "messages" in v:
-            v = v["messages"]
-        elif "content" in v:
-            v = v["content"]
-    if isinstance(v, list) and v and isinstance(v[-1], dict):
-        v = v[-1].get("content", v[-1])
-    s = v if isinstance(v, str) else str(v)
-    s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
 class TTLCache:
     def __init__(self) -> None:
         self._d: dict[Any, tuple[float, Any]] = {}
@@ -189,7 +167,7 @@ async def probe(name: str, fn) -> dict:
     try:
         detail, ok, err = await fn(), True, None
     except Exception as e:  # noqa: BLE001 - any failure means "down"
-        detail, ok, err = {}, False, f"{type(e).__name__}: {e}"[:240]
+        detail, ok, err = {}, False, err_text(e)
     return {"name": name, "ok": ok, "ms": round((time.perf_counter() - t0) * 1000, 1), "error": err, "detail": detail}
 
 
@@ -262,8 +240,8 @@ where ts >= %(since)s order by ts desc limit 25
 """
 
 KILL_SQL = """
-select detail, extract(epoch from ts)::float as t from harness.guardrail_events
-where kind = 'kill_switch' order by ts desc limit 1
+select stopped, extract(epoch from clock_timestamp())::float as checked_at
+from harness_guardrails.dispatch_policy where singleton
 """
 
 
@@ -323,9 +301,14 @@ class Backend:
         self.qdrant = _env("QDRANT_URL", "http://qdrant:6333").rstrip("/")
         self.ollama = _env("OLLAMA_URL", "http://host.docker.internal:11434").rstrip("/")
         self.db_url = _env("DASHBOARD_DATABASE_URL")
+        if not self.db_url and _env("DASHBOARD_DB_HOST"):
+            self.db_url = make_conninfo(
+                host=_env("DASHBOARD_DB_HOST"), dbname="postgres",
+                user="dashboard_ro", password=_env("DASHBOARD_DB_PASSWORD"),
+            )
         # Langfuse v4 pipeline: only probed when configured (they're unpublished, compose-network only)
         self.extra_probes = {k: _env(f"PROBE_{k.upper().replace('-', '_')}") for k in PIPELINE}
-        self.http = httpx.AsyncClient(timeout=10)
+        self.http = httpx.AsyncClient(timeout=10, trust_env=False)
         self.routes: dict[str, str] = load_config_routes(_env("LITELLM_CONFIG", "litellm.config.yaml"))
         self.cache = TTLCache()
         self.history: dict[str, deque] = defaultdict(lambda: deque(maxlen=HISTORY_SAMPLES))
@@ -416,7 +399,7 @@ class Backend:
         try:
             await self.refresh_routes()
         except (httpx.HTTPError, ValueError, KeyError) as e:
-            d["routes_error"] = str(e)[:160]
+            d["routes_error"] = err_text(e)
         d["routes"] = len(self.routes)
         return d
 
@@ -503,7 +486,7 @@ class Backend:
     async def _postgres(self) -> dict:
         if not self.db_url:
             raise RuntimeError("DASHBOARD_DATABASE_URL not set")
-        async with await psycopg.AsyncConnection.connect(self.db_url, connect_timeout=5, row_factory=dict_row) as c:
+        async with await self._db() as c:
             r = await (await c.execute("""
                 select current_setting('server_version') as version,
                        pg_database_size(current_database()) as size,
@@ -679,11 +662,10 @@ class Backend:
                             "detail": (f"Allowlist dropped {sd} out-of-scope requests. The guard works, but the planner is straying." if sd
                                        else "No out-of-scope requests attempted.")})
                 ks = h.get("kill_switch")
-                out.append({"id": "kill", "label": "Kill switch",
+                out.append({"id": "kill", "label": "Shared stop",
                             "status": "unknown" if not ks else ("warning" if ks["state"] == "engaged" else "good"),
-                            "value": ks["state"] if ks else "never used",
-                            "detail": "Engaged: runners should be halted." if ks and ks["state"] == "engaged"
-                            else "Runners free to run."})
+                            "value": ks["state"] if ks else "unavailable",
+                            "detail": "Live shared policy. A local stop file can also halt its runner."})
             else:
                 out.append({"id": "evidence", "label": "Harness findings DB", "status": "unknown", "value": "not set up",
                             "detail": h.get("error") or "Apply db/harness.sql to enable the funnel, evidence and scope checks."})
@@ -717,7 +699,7 @@ class Backend:
         def pick(e: dict, ok: bool) -> dict:
             model = e.get("model") or ""
             return {"route": e.get("model_name") or self.route_of(model), "model": model, "ok": ok,
-                    "error": None if ok else preview(e.get("error"), 300)}
+                    "error": None if ok else "Upstream route check failed"}
         return {"at": time.time(),
                 "results": [pick(e, True) for e in j.get("healthy_endpoints", [])]
                 + [pick(e, False) for e in j.get("unhealthy_endpoints", [])]}
@@ -800,14 +782,27 @@ class Backend:
             "latency_ms": (et - st) * 1000 if st and et else None,
             "in_tok": num(o.get("inputUsage") or ud.get("input")),
             "out_tok": num(o.get("outputUsage") or ud.get("output")),
-            "cost": num(o.get("totalCost") or (o.get("costDetails") or {}).get("total")),
-            "level": o.get("level") or "DEFAULT", "status": o.get("statusMessage"),
+            "cost": opt_num(o.get("totalCost", (o.get("costDetails") or {}).get("total"))),
+            "level": o.get("level") or "DEFAULT",
         }
 
         # ---- harness DB ----------------------------------------------------------
 
-    async def _db(self):
-        return await psycopg.AsyncConnection.connect(self.db_url, connect_timeout=5, row_factory=dict_row)
+    async def _db(self, row_factory=dict_row):
+        conn = await psycopg.AsyncConnection.connect(
+            self.db_url, connect_timeout=5, row_factory=row_factory,
+        )
+        try:
+            await conn.execute("set transaction read only")
+            cur = conn.cursor(row_factory=tuple_row)
+            await cur.execute("select current_user = 'dashboard_ro'")
+            row = await cur.fetchone()
+            if row != (True,):
+                raise RuntimeError("dashboard requires the dashboard_ro database role")
+            return conn
+        except BaseException:
+            await conn.close()
+            raise
 
     async def harness(self, since: float) -> dict:
         async def fetch():
@@ -826,16 +821,20 @@ class Backend:
                     findings = [r["t"] for r in await rows(FINDINGS_TS_SQL)]
                     guard_ts = [(r["t"], r["kind"]) for r in await rows(GUARD_TS_SQL)]
                     recent = await rows(GUARD_RECENT_SQL)
-                    kill = await rows(KILL_SQL, None)
+                    has_guardrails = await rows(
+                        "select has_schema_privilege(to_regnamespace('harness_guardrails'), 'USAGE') as allowed",
+                        None,
+                    )
+                    kill = await rows(KILL_SQL, None) if has_guardrails[0]["allowed"] else []
                     runs = await rows(RUNS_SQL, {**p, "limit": 50})
             except psycopg.Error as e:
-                return {"available": False, "error": f"Postgres: {str(e).strip()[:200]}"}
+                return {"available": False, "error": f"Postgres: {err_text(e)}"}
             return {
                 "available": True, "funnel": {k: int(v or 0) for k, v in funnel.items()},
                 "findings_ts": findings,
                 "guardrails": {"by_kind": dict(Counter(k for _, k in guard_ts)), "ts": guard_ts, "recent": recent},
-                "kill_switch": ({"state": "engaged" if (kill[0]["detail"] or "").lower().startswith("engag") else "released",
-                                 "at": kill[0]["t"]} if kill else None),
+                "kill_switch": ({"state": "engaged" if kill[0]["stopped"] else "released",
+                                 "at": kill[0]["checked_at"]} if kill else None),
                 "runs": runs,
             }
         return await self.cache.get(("harness", since), 30, fetch)
@@ -1013,17 +1012,16 @@ class Backend:
         h = fl["harness"]
         if not h.get("available"):
             return {"available": False, "error": h.get("error"), "targets": [t.summary() for t in lab.targets.values()]}
-        spend = {r["id"]: r for r in fl["runs"]}
+        spend = {}
+        notes = list(fl["notes"])
         try:
-            for srow in await self.session_rows(since, time.time()):
-                spend.setdefault(srow["session_id"], {"cost": srow["cost"], "calls": srow["calls"]})
-        except Exception:  # noqa: BLE001 - flows already noted Langfuse trouble
-            pass
-        runs = [{**r, "cost": (spend.get(r["id"]) or {}).get("cost", 0.0), "calls": (spend.get(r["id"]) or {}).get("calls")}
+            spend = {row["session_id"]: row for row in await self.session_rows(since, time.time())}
+        except Exception as exc:
+            notes.append(f"Eval spend unavailable: {err_text(exc)}")
+        runs = [{**r, "cost": (spend.get(r["id"]) or {}).get("cost"), "calls": (spend.get(r["id"]) or {}).get("calls")}
                 for r in await self.run_rows(since, 1000)]
-        verdicts = [v for v in await self.verdict_rows(since) if v["label"] == "confirmed" and v.get("evidence_ref")]
-        out = lab.score(runs, verdicts)
-        return {**out, "range": rng, "notes": fl["notes"]}
+        out = lab.score(runs, await self.verdict_rows(since))
+        return {**out, "range": rng, "notes": notes}
 
     async def run_rows(self, since: float, limit: int) -> list[dict]:
         async def fetch():
@@ -1067,8 +1065,7 @@ class Backend:
         lab_t, twin = self.lab.target_of(run.get("target"))
         score = None
         if lab_t:
-            conf = [v for v in verdicts if v["label"] == "confirmed" and v.get("evidence_ref")]
-            res = self.lab.score([{**run, "cost": cost}], conf)
+            res = self.lab.score([{**run, "cost": cost if steps else None}], verdicts)
             score = res["runs"][0] if res["runs"] else None
             if score:
                 gt = lab_t.summary()
@@ -1084,7 +1081,7 @@ class Backend:
         }
 
     def _lf_link(self, trace_id: str | None) -> str | None:
-        return f"{self.langfuse_ui}/project/{self.lf_project}/traces/{trace_id}" if trace_id else None
+        return f"{self.langfuse_ui}/project/{self.lf_project}/traces/{quote(trace_id, safe='')}" if trace_id else None
 
     async def _raw_obs(self, rng: str, cursor: str | None, fields: str, **extra) -> dict:
         now = time.time()
@@ -1095,21 +1092,21 @@ class Backend:
         return j
 
     async def raw_generations(self, rng: str, cursor: str | None) -> dict:
-        j = await self._raw_obs(rng, cursor, "core,basic,model,usage,io,metadata", filter=json.dumps(GEN_FILTER))
-        rows = [{**self.norm_obs(o), "input": preview(o.get("input")), "output": preview(o.get("output")),
-                 "link": self._lf_link(o.get("traceId")), "raw": clean(o)} for o in j.get("data") or []]
+        j = await self._raw_obs(rng, cursor, "core,basic,model,usage", filter=json.dumps(GEN_FILTER))
+        rows = []
+        for observation in j.get("data") or []:
+            metadata = self.norm_obs(observation)
+            rows.append({**metadata, "link": self._lf_link(metadata["trace_id"]), "raw": metadata})
         return {"rows": rows, "next": (j.get("meta") or {}).get("cursor"), "comment": (j.get("meta") or {}).get("comment")}
 
     async def raw_traces(self, rng: str, cursor: str | None) -> dict:
         """Root observations stand in for traces (v4 has no trace list endpoint)."""
-        j = await self._raw_obs(rng, cursor, "core,basic,usage,io,trace_context", isRootObservation="true")
+        j = await self._raw_obs(rng, cursor, "core,basic,usage,trace_context", isRootObservation="true")
         rows = []
-        for o in j.get("data") or []:
-            n = self.norm_obs(o)
-            rows.append({"id": o.get("traceId"), "ts": n["ts"], "name": o.get("traceName") or n["name"],
-                         "session_id": o.get("sessionId"), "tags": o.get("tags") or [], "type": o.get("type"),
-                         "latency_ms": n["latency_ms"], "cost": n["cost"], "input": preview(o.get("input")),
-                         "link": self._lf_link(o.get("traceId")), "raw": clean(o)})
+        for observation in j.get("data") or []:
+            metadata = self.norm_obs(observation)
+            trace_id = metadata["trace_id"]
+            rows.append({**metadata, "id": trace_id, "link": self._lf_link(trace_id), "raw": metadata})
         return {"rows": rows, "next": (j.get("meta") or {}).get("cursor"), "comment": (j.get("meta") or {}).get("comment")}
 
     async def raw_tables(self) -> dict:
@@ -1163,8 +1160,7 @@ class Backend:
         if not self.db_url:
             raise ValueError("DASHBOARD_DATABASE_URL not set")
         t0 = time.perf_counter()
-        async with await psycopg.AsyncConnection.connect(self.db_url, connect_timeout=5) as c:
-            await c.execute("set transaction read only")
+        async with await self._db(row_factory=tuple_row) as c:
             await c.execute("set local statement_timeout = '5s'")
             cur = await c.execute(q, prepare=False)
             if cur.description is None:

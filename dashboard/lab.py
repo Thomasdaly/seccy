@@ -183,7 +183,11 @@ class LabIndex:
             found: dict[str, int] = {}
             fps: dict[str, int] = {}
             counts = {"tp": 0, "fp": 0, "other": 0, "unmatched": 0}
-            for v in by_run.get(r["id"], []):
+            rows = by_run.get(r["id"], [])
+            has_pending = any(v["label"] == "needs_review" for v in rows)
+            for v in rows:
+                if v["label"] != "confirmed" or not v.get("evidence_ref"):
+                    continue
                 outcome, entry = t.classify(v["method"], v["path"], twin)
                 counts[outcome] += 1
                 key = entry["id"] if entry else f"{v['method']} {v['path']}"
@@ -194,30 +198,31 @@ class LabIndex:
             hit = [f["id"] for f in t.denominator if f["id"] in found]
             recall_applies = twin == "vulnerable" or any(not f["gated"] for f in t.denominator)
             denom = t.denominator if twin == "vulnerable" else [f for f in t.denominator if not f["gated"]]
-            cost = r.get("cost") or 0.0
+            cost = r.get("cost")
+            complete = r.get("status") == "done" and not has_pending
             scored.append({
                 "id": r["id"], "lab": t.name, "twin": twin, "status": r.get("status"), "started_at": r.get("started_at"),
                 "ended_at": r.get("ended_at"), "cost": cost, "calls": r.get("calls"),
-                "found": found, "fps": fps, "counts": counts,
-                "recall": (len([f for f in hit if f in {d['id'] for d in denom}]) / len(denom)) if recall_applies and denom else None,
+                "found": found, "fps": fps, "counts": counts, "complete": complete,
+                "recall": len(hit) / len(denom) if complete and recall_applies and denom else None,
                 "hit": len(hit), "of": len(denom) if recall_applies else None,
-                "cost_per_bug": (cost / len(hit)) if hit and cost else None,
+                "cost_per_bug": cost / len(found) if complete and found and cost is not None else None,
             })
         scored.sort(key=lambda s: s["started_at"] or 0, reverse=True)
         targets = []
         for t in self.targets.values():
             mine = [s for s in scored if s["lab"] == t.name]
-            vuln = [s for s in mine if s["twin"] == "vulnerable" and s["status"] != "running"]
+            vuln = [s for s in mine if s["twin"] == "vulnerable" and s["complete"]]
             latest = vuln[0] if vuln else None
-            ctrl = next((s for s in mine if s["twin"] == "control" and s["status"] != "running"), None)
-            spent = sum(s["cost"] for s in vuln)
-            bugs = sum(s["hit"] for s in vuln)
+            ctrl = next((s for s in mine if s["twin"] == "control" and s["complete"]), None)
+            spent = sum(s["cost"] for s in vuln) if all(s["cost"] is not None for s in vuln) else None
+            bugs = sum(len(s["found"]) for s in vuln)
             targets.append({
                 **t.summary(), "runs": len(mine),
                 "latest": latest, "latest_control": ctrl,
                 "recall_series": [{"id": s["id"], "t": s["started_at"], "recall": s["recall"]} for s in reversed(vuln)],
                 "fp_latest": (latest["counts"]["fp"] if latest else 0) + (ctrl["counts"]["fp"] if ctrl else 0) if (latest or ctrl) else None,
-                "cost_per_bug": (spent / bugs) if bugs and spent else None,
+                "cost_per_bug": spent / bugs if bugs and spent is not None else None,
                 "columns": mine[:limit_cols],
             })
         return {"available": bool(self.targets), "dir": self.dir, "errors": self.errors, "targets": targets, "runs": scored}

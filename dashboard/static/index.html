@@ -3,50 +3,60 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Harness Console</title>
+  <title>Seccy · Harness Console</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%232a78d6'/%3E%3Cpath d='M4 11V5m4 6V7m4 4V3' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <a href="#view-title" class="skip-link">Skip to dashboard</a>
   <header class="top">
     <div class="brand">
-      <svg class="glyph" viewBox="0 0 16 16" aria-hidden="true"><rect width="16" height="16" rx="4"/><path d="M4 11V5m4 6V7m4 4V3" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>
-      Harness <span class="muted">console</span>
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <span class="brand-name">Seccy</span>
+      <span class="brand-context">Harness console</span>
     </div>
-    <nav class="tabs" role="tablist" aria-label="Views">
-      <button role="tab" data-tab="health">Health</button>
-      <button role="tab" data-tab="trends">Trends</button>
-      <button role="tab" data-tab="flows">Flows</button>
-      <button role="tab" data-tab="findings">Findings</button>
-      <button role="tab" data-tab="eval">Eval</button>
-      <button role="tab" data-tab="raw">Raw</button>
-    </nav>
     <div class="top-right">
+      <span id="demo-banner" class="pill demo-banner" hidden title="Synthetic dashboard data">Demo data</span>
       <span id="stack-pill" class="pill" hidden></span>
-      <span id="updated" class="muted small"></span>
     </div>
+    <nav aria-label="Dashboard views">
+      <div class="tabs" role="tablist" aria-label="Views">
+        <button type="button" role="tab" id="nav-health" aria-controls="tab-health" aria-selected="true" data-tab="health">Health</button>
+        <button type="button" role="tab" id="nav-trends" aria-controls="tab-trends" aria-selected="false" tabindex="-1" data-tab="trends">Trends</button>
+        <button type="button" role="tab" id="nav-flows" aria-controls="tab-flows" aria-selected="false" tabindex="-1" data-tab="flows">Flows</button>
+        <button type="button" role="tab" id="nav-findings" aria-controls="tab-findings" aria-selected="false" tabindex="-1" data-tab="findings">Findings</button>
+        <button type="button" role="tab" id="nav-eval" aria-controls="tab-eval" aria-selected="false" tabindex="-1" data-tab="eval">Eval</button>
+        <button type="button" role="tab" id="nav-raw" aria-controls="tab-raw" aria-selected="false" tabindex="-1" data-tab="raw">Raw</button>
+      </div>
+    </nav>
   </header>
-  <div id="demo-banner" class="demo-banner" hidden>
-    <strong>Demo data.</strong> Synthetic runs, not your stack. Unset <code>DASHBOARD_DEMO</code> to read the live services.
-  </div>
-  <div class="filters">
-    <div id="range" class="seg" role="radiogroup" aria-label="Time range"></div>
-    <label class="toggle"><input type="checkbox" id="auto" checked> Auto-refresh 30s</label>
-    <button id="refresh" class="btn">Refresh</button>
-  </div>
   <main id="main">
-    <section id="tab-health" class="tab" role="tabpanel" hidden></section>
-    <section id="tab-trends" class="tab" role="tabpanel" hidden></section>
-    <section id="tab-flows" class="tab" role="tabpanel" hidden></section>
-    <section id="tab-findings" class="tab" role="tabpanel" hidden></section>
-    <section id="tab-eval" class="tab" role="tabpanel" hidden></section>
-    <section id="tab-raw" class="tab" role="tabpanel" hidden></section>
+    <div class="page-heading">
+      <div>
+        <h1 id="view-title" tabindex="-1">Stack health</h1>
+        <p id="view-description">Service availability, stack checks and disk capacity.</p>
+      </div>
+      <div class="filters" role="group" aria-label="Dashboard controls">
+        <fieldset id="range" class="seg" hidden><legend class="sr-only">Time range</legend></fieldset>
+        <label class="toggle" id="auto-control"><input type="checkbox" id="auto" checked> Auto-refresh 30s</label>
+        <button type="button" id="refresh" class="btn">Refresh</button>
+      </div>
+    </div>
+    <p id="updated" class="view-status" role="status"></p>
+    <div id="load-state"></div>
+    <section id="tab-health" class="tab" role="tabpanel" aria-labelledby="nav-health" tabindex="0"></section>
+    <section id="tab-trends" class="tab" role="tabpanel" aria-labelledby="nav-trends" tabindex="0" hidden></section>
+    <section id="tab-flows" class="tab" role="tabpanel" aria-labelledby="nav-flows" tabindex="0" hidden></section>
+    <section id="tab-findings" class="tab" role="tabpanel" aria-labelledby="nav-findings" tabindex="0" hidden></section>
+    <section id="tab-eval" class="tab" role="tabpanel" aria-labelledby="nav-eval" tabindex="0" hidden></section>
+    <section id="tab-raw" class="tab" role="tabpanel" aria-labelledby="nav-raw" tabindex="0" hidden></section>
+    <noscript><p class="notice">JavaScript is required to load dashboard data.</p></noscript>
   </main>
-  <div id="tooltip" class="tooltip" hidden></div>
-  <aside id="drawer" class="drawer" hidden aria-label="Record detail">
-    <header><h3 id="drawer-title"></h3><button id="drawer-close" class="btn">Close</button></header>
-    <div id="drawer-body" class="drawer-body"></div>
-  </aside>
+  <div id="tooltip" class="tooltip" aria-hidden="true" hidden></div>
+  <dialog id="drawer" class="drawer" aria-labelledby="drawer-title">
+    <header><h2 id="drawer-title"></h2><button type="button" id="drawer-close" class="btn" autofocus>Close</button></header>
+    <div id="drawer-body" class="drawer-body" tabindex="0" role="group" aria-label="Record details"></div>
+  </dialog>
   <script type="module" src="app.js"></script>
 </body>
 </html>

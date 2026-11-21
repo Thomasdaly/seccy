@@ -90,8 +90,9 @@ The dashboard only reads. Three things make the Flows view work:
 
 | Env | Default | |
 |---|---|---|
-| `DASHBOARD_PASSWORD` | — | Basic-auth password. If empty, auth is off and a warning is logged. |
-| `DASHBOARD_DATABASE_URL` | — | `postgresql://dashboard_ro:…@postgres:5432/postgres` |
+| `DASHBOARD_PASSWORD` | — | Required in live mode. Explicit demo mode can run without a password. |
+| DASHBOARD_DATABASE_URL | — | Optional full connection string for dashboard_ro. |
+| DASHBOARD_DB_HOST, DASHBOARD_DB_PASSWORD | — | Connection fields used by Compose. |
 | `LITELLM_URL`, `LITELLM_MASTER_KEY` | `http://litellm:4000` | |
 | `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | `http://langfuse:3000` | v4 API (`v2/metrics`, `v2/observations`) |
 | `LANGFUSE_UI_URL` | `LANGFUSE_HOST` | for "Open in Langfuse" links |

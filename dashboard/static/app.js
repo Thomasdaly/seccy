@@ -61,7 +61,8 @@ const fmtIn = (t) => {
 };
 const dtf = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const df = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
-const dfw = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+const dfUTC = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+const dfw = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
 const tf = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
 const fmtWhen = (t) => (t ? dtf.format(new Date(t * 1000)) : "—");
 const fmtDur = (a, b) => {
@@ -69,12 +70,12 @@ const fmtDur = (a, b) => {
   const d = b - a;
   return d < 3600 ? `${Math.max(1, Math.round(d / 60))} min` : `${(d / 3600).toFixed(1)} h`;
 };
-const bucketLabel = (step) => (t) => (step < 86400 ? tf.format(new Date(t * 1000)) : df.format(new Date(t * 1000)));
+const bucketLabel = (step) => (t) => (step < 86400 ? tf.format(new Date(t * 1000)) : dfUTC.format(new Date(t * 1000)));
 const bucketTitle = (step) => (t) => {
   const d = new Date(t * 1000);
   if (step < 86400) return `${df.format(d)}, ${tf.format(d)}–${tf.format(new Date((t + step) * 1000))}`;
   if (step === 86400) return dfw.format(d) + " (UTC day)";
-  return "Week of " + df.format(d);
+  return `Week of ${dfUTC.format(d)} (UTC)`;
 };
 const RANGE_LABEL = { "24h": "last 24 hours", "7d": "last 7 days", "30d": "last 30 days", "90d": "last 13 weeks" };
 
@@ -85,7 +86,7 @@ const slot = (route) => {
   return route === "other" || i < 0 ? 0 : (i % 8) + 1;
 };
 const colorOf = (route) => (slot(route) ? `var(--s${slot(route)})` : "var(--s-other)");
-const inkOn = (route) => (slot(route) === 4 ? "#0b0b0b" : "#ffffff");
+const inkOn = (route) => (slot(route) === 4 ? "#16251f" : "var(--flow-label)");
 const ROUTE_ROLE = { glue: "local · classify/normalise", embed: "local · dedup vectors", planner: "hosted open · probe planning", judge: "frontier · final verdict", other: "unmapped model" };
 
 // ---------------------------------------------------------------- icons
@@ -111,22 +112,32 @@ const badge = (status, text) => h("span", { class: "badge" }, statusIcon(status)
 const routeKey = (route, kind = "dot") => h("span", { class: "cell-key" }, h("span", { class: `key-${kind}`, style: { background: colorOf(route) } }), route);
 
 // ---------------------------------------------------------------- state
-const state = { tab: "health", range: "7d", raw: "generations", page: 1, table: null, collection: null, meta: null, cache: {}, timer: null, sql: "" };
-const TABS = ["health", "trends", "flows", "findings", "eval", "raw"];
+const state = { tab: "health", range: "7d", raw: "generations", page: 1, table: null, collection: null, cache: {}, timer: null, sql: "" };
+const VIEWS = {
+  health: ["Stack health", "Service availability, stack checks and disk capacity."],
+  trends: ["Usage trends", "Spend, volume, errors and latency across model routes."],
+  flows: ["Workflow activity", "Route usage, run activity and guardrail events."],
+  findings: ["Findings", "Review verdicts, evidence references and ground-truth matches."],
+  eval: ["Lab evaluation", "Recall, false positives and coverage across scored runs."],
+  raw: ["Raw data", "Browse traces, generations, database records and vector-store metadata."],
+};
+const TABS = Object.keys(VIEWS);
+const tabButtons = [...document.querySelectorAll(".tabs button")];
 
 function readHash() {
   const [tab, q] = location.hash.replace(/^#\/?/, "").split("?");
-  if (TABS.includes(tab)) state.tab = tab;
+  state.tab = TABS.includes(tab) ? tab : "health";
   const p = new URLSearchParams(q || "");
-  if (p.get("range") && ["24h", "7d", "30d", "90d"].includes(p.get("range"))) state.range = p.get("range");
-  if (p.get("raw")) state.raw = p.get("raw");
+  state.range = Object.hasOwn(RANGE_LABEL, p.get("range")) ? p.get("range") : "7d";
+  state.raw = RAW_TABS.some(([key]) => key === p.get("raw")) ? p.get("raw") : "generations";
   state.run = p.get("run") || null;
 }
-function writeHash() {
+function writeHash({ replace = false } = {}) {
   const q = new URLSearchParams({ range: state.range });
   if (state.tab === "raw") q.set("raw", state.raw);
   if (state.run) q.set("run", state.run);
-  history.replaceState(null, "", `#/${state.tab}?${q}`);
+  const hash = `#/${state.tab}?${q}`;
+  if (hash !== location.hash) history[replace ? "replaceState" : "pushState"](null, "", hash);
 }
 
 async function api(path, opts) {
@@ -138,7 +149,7 @@ async function api(path, opts) {
 }
 
 // ---------------------------------------------------------------- charts mount + resize
-const drawers = new Map();
+const drawers = new WeakMap();
 const widths = new WeakMap();
 const ro = new ResizeObserver((entries) => {
   for (const e of entries) {
@@ -150,7 +161,6 @@ const ro = new ResizeObserver((entries) => {
 });
 function mount(el, draw) {
   drawers.set(el, () => draw(el));
-  ro.observe(el);
   return el;
 }
 
@@ -164,42 +174,47 @@ function table(cols, rows, { onRow, empty = "Nothing here yet.", cap } = {}) {
   if (cap && rows.length > cap) {
     const wrap = h("div", {}, table(cols, rows.slice(0, cap), { onRow }));
     const btn = h("button", { class: "link-btn more-row" }, `Show all ${rows.length}`);
-    btn.addEventListener("click", () => wrap.replaceChildren(table(cols, rows, { onRow })));
+    btn.addEventListener("click", () => {
+      const all = table(cols, rows, { onRow });
+      wrap.replaceChildren(all);
+      (all.querySelectorAll(".row-action")[cap] || all).focus();
+    });
     wrap.append(btn);
     return wrap;
   }
-  return h("div", { class: "table-wrap" }, h("table", { class: "data" },
-    h("thead", {}, h("tr", {}, cols.map((c) => h("th", { class: c.align === "r" ? "r" : null }, c.label)))),
+  return h("div", { class: "table-wrap", tabindex: 0, role: "group", "aria-label": "Scrollable data table" }, h("table", { class: "data" },
+    h("thead", {}, h("tr", {}, cols.map((c) => h("th", { scope: "col", class: c.align === "r" ? "r" : null }, c.label || h("span", { class: "sr-only" }, "Links"))))),
     h("tbody", {}, rows.map((r) => {
-      const tr = h("tr", onRow ? { class: "clickable", tabindex: 0, onclick: () => onRow(r), onkeydown: (e) => { if (e.key === "Enter") onRow(r); } } : {},
-        cols.map((c) => {
-          const v = c.render ? c.render(r) : c.fmt ? c.fmt(r[c.key]) : r[c.key];
-          return h("td", { class: [c.align === "r" ? "r" : "", c.cls || ""].join(" ").trim() || null, title: c.title ? c.title(r) : null }, v ?? "—");
-        }));
-      return tr;
+      return h("tr", onRow ? { class: "clickable", onclick: () => onRow(r) } : {}, cols.map((c, index) => {
+        const value = (c.render ? c.render(r) : c.fmt ? c.fmt(r[c.key]) : r[c.key]) ?? "—";
+        const content = onRow && index === 0
+          ? h("button", { type: "button", class: "row-action", onclick: (event) => { event.stopPropagation(); onRow(r); } },
+            value, h("span", { class: "sr-only" }, " — View details"))
+          : value;
+        return h("td", { class: [c.align === "r" ? "r" : "", c.cls || ""].join(" ").trim() || null, title: c.title ? c.title(r) : null }, content);
+      }));
     }))));
 }
 
-function chartCard({ title, sub, draw, tableView, legendItems, legendKind, cls }) {
+function chartCard({ title, sub, draw, tableView, legendItems, legendKind, cls, heading = "h2" }) {
   const body = mount(h("div", { class: "chart" }), draw);
   const tbl = h("div", { hidden: true });
-  const btn = h("button", { class: "link-btn", "aria-pressed": "false" }, "Table");
+  const btn = h("button", { class: "link-btn", "aria-pressed": "false", "aria-label": `Table for ${title}` }, "Table");
   btn.addEventListener("click", () => {
     const on = tbl.hidden;
     tbl.hidden = !on;
     body.hidden = on;
-    btn.textContent = on ? "Chart" : "Table";
     btn.setAttribute("aria-pressed", String(on));
     if (on) tbl.replaceChildren(tableView());
     else drawers.get(body)?.();
   });
   return h("div", { class: "card" + (cls ? " " + cls : "") },
-    h("div", { class: "card-head" }, h("div", {}, h("h3", {}, title), sub ? h("p", { class: "sub" }, sub) : null), tableView ? h("div", { class: "actions" }, btn) : null),
+    h("div", { class: "card-head" }, h("div", {}, h(heading, {}, title), sub ? h("p", { class: "sub" }, sub) : null), tableView ? h("div", { class: "actions" }, btn) : null),
     legendItems ? legend(legendItems, legendKind) : null, body, tbl);
 }
 
 function card(title, sub, ...kids) {
-  return h("div", { class: "card" }, h("div", { class: "card-head" }, h("div", {}, h("h3", {}, title), sub ? h("p", { class: "sub" }, sub) : null)), ...kids);
+  return h("div", { class: "card" }, h("div", { class: "card-head" }, h("div", {}, h("h2", {}, title), sub ? h("p", { class: "sub" }, sub) : null)), ...kids);
 }
 
 function seriesTable(buckets, step, series, fmt) {
@@ -237,20 +252,24 @@ function kv(pairs) {
   return h("dl", { class: "kv" }, pairs.filter(([, v]) => v != null && v !== "").map(([k, v]) => [h("dt", {}, k), h("dd", {}, String(v))]));
 }
 
-function updatePill(services) {
-  const worst = services.some((x) => x.status === "critical") ? "critical" : services.some((x) => x.status === "warning") ? "warning" : "good";
-  const down = services.filter((x) => x.status === "critical").length;
+function updatePill({ services, at }) {
+  const down = services.filter((service) => service.ok === false).length;
+  const degraded = services.some((service) => ["warning", "serious"].includes(service.status));
+  const worst = down ? "critical" : degraded ? "warning" : services.length ? "good" : "unknown";
+  const label = { good: "Services up", critical: `${down} down`, warning: "Degraded", unknown: "No service data" }[worst];
   const pill = $("#stack-pill");
   pill.hidden = false;
-  pill.replaceChildren(statusIcon(worst), worst === "good" ? "All services up" : worst === "critical" ? `${down} service${down > 1 ? "s" : ""} down` : "Degraded");
+  pill.title = at ? `Service probes at ${fmtWhen(at)}` : "Service probes";
+  pill.replaceChildren(statusIcon(worst), label);
 }
 
-function renderHealth(d) {
-  updatePill(d.services);
+const CHECK_PRIORITY = { critical: 0, serious: 1, warning: 2, unknown: 3, good: 4 };
 
-  const checks = card("Stack checks", "The harness design principles, checked against live state.",
-    h("div", { class: "checks" }, d.checks.map((c) => h("div", { class: "check" },
-      statusIcon(c.status), h("span", { class: "name" }, c.label), h("span", { class: "val" }, c.value),
+function renderHealth(d) {
+  const orderedChecks = [...d.checks].sort((a, b) => CHECK_PRIORITY[a.status] - CHECK_PRIORITY[b.status]);
+  const checks = card("Stack checks", "Failures and warnings appear first.",
+    h("div", { class: "checks" }, orderedChecks.map((c) => h("div", { class: "check", "data-tone": c.status },
+      statusIcon(c.status), h("span", { class: "name" }, h("span", { class: "sr-only" }, `${STATUS_LABEL[c.status]} — `), c.label), h("span", { class: "val" }, c.value),
       h("span", { class: "det" }, c.detail + (c.at ? ` Last trace ${fmtAgo(c.at)}.` : ""))))));
 
   const PIPE = ["langfuse-worker", "clickhouse", "redis", "minio"];
@@ -324,10 +343,28 @@ function renderHealth(d) {
       { label: "Vectors", key: "vectors" },
     ], qd.collections || [], { empty: "No collections yet. The orchestrator creates one when it first stores a finding embedding." }));
 
+  const up = d.services.filter((service) => service.ok).length;
+  const degraded = d.services.filter((service) => service.status === "warning").length;
+  const failures = orderedChecks.filter((check) => check.status === "critical").length;
+  const warnings = orderedChecks.filter((check) => ["warning", "serious"].includes(check.status)).length;
+  const unknown = orderedChecks.filter((check) => check.status === "unknown").length;
+  const langfuse = d.services.find((service) => service.name === "langfuse" && service.ok)?.detail;
+  const spend = langfuse?.cost_24h;
+  const summary = h("section", { class: "tiles health-summary", "aria-label": "Health summary" },
+    tile("Services reachable", d.services.length ? `${up} / ${d.services.length}` : "—",
+      d.services.length ? `${d.services.length - up} down · ${degraded} degraded` : "No service probes", false,
+      up < d.services.length ? "critical" : degraded ? "warning" : up ? "good" : null),
+    tile("Checks needing attention", fmtInt(failures + warnings),
+      `${failures} failing · ${warnings} warning · ${unknown} unknown`, false, failures ? "critical" : warnings ? "warning" : null),
+    tile("LLM spend · 24h", fmtUSD(spend),
+      spend == null ? "Langfuse data unavailable" : `${fmtInt(langfuse.gens_24h)} traced calls`),
+    tile("Docker disk free", `${dk.free_pct.toFixed(0)}%`, `${fmtBytes(dk.free)} of ${fmtBytes(dk.total)}`, false, diskStatus));
+
   return [
-    h("p", { class: "lede" }, h("strong", {}, "Is the stack up right now? "), "The dashboard container probes every service every 30 s. Strips show 15-minute cells; history resets when the dashboard restarts."),
+    summary,
     checks,
     h("h2", { class: "section-title" }, "Services"),
+    h("p", { class: "lede small" }, "Probes run every 30 seconds. Uptime strips show 15-minute intervals and reset when the dashboard restarts."),
     h("div", { class: "grid g-auto" }, svcCards),
     pipeCards.length ? [h("h2", { class: "section-title" }, "Langfuse v4 pipeline"),
       h("p", { class: "lede small" }, "LiteLLM exports over OTLP to Langfuse; the worker drains Redis into ClickHouse and MinIO. If any of these stop, calls still succeed but spend and traces go dark."),
@@ -339,8 +376,9 @@ function renderHealth(d) {
 
 // ================================================================= TRENDS
 
-function tile(label, value, hint, hero) {
-  return h("div", { class: "tile" + (hero ? " hero" : "") }, h("div", { class: "label" }, label), h("div", { class: "value" }, value), hint ? h("div", { class: "hint" }, hint) : null);
+function tile(label, value, hint, hero, tone) {
+  return h("div", { class: "tile" + (hero ? " hero" : ""), "data-tone": tone },
+    h("div", { class: "label" }, label), h("div", { class: "value num" }, value), hint ? h("div", { class: "hint" }, hint) : null);
 }
 
 function renderTrends(d) {
@@ -348,18 +386,23 @@ function renderTrends(d) {
   const routes = d.routes;
   const fx = bucketLabel(d.step), tx = bucketTitle(d.step);
   const base = { buckets: d.buckets, fmtX: fx, titleX: tx };
+  const usageAvailable = !d.notes?.length;
+  const usage = (value, format) => usageAvailable ? format(value) : "—";
+  const usageHint = (hint) => usageAvailable ? hint : "Usage data unavailable";
+  const costPerThousand = t.calls > 0 ? `${fmtUSD(1000 * t.cost / t.calls)} per 1,000 calls` : "No traced calls";
 
   const judgeP95 = t.p95?.judge;
   const tiles = h("div", { class: "tiles" },
-    tile("LLM spend", fmtUSD(t.cost), RANGE_LABEL[d.range], true),
-    tile("Calls", fmtInt(t.calls), "generations"),
-    tile("Tokens", fmtInt(t.tokens), "input + output"),
-    tile("Error rate", fmtPct(t.error_rate, 1), `${fmtInt(t.errors)} errored generations`),
-    tile("Judge p95", fmtMs(judgeP95), "frontier verdict latency"),
+    tile("LLM spend", usage(t.cost, fmtUSD), usageHint(costPerThousand), true),
+    tile("Calls", usage(t.calls, fmtInt), usageHint("Traced generations")),
+    tile("Tokens", usage(t.tokens, fmtInt), usageHint("Input + output")),
+    tile("Error rate", usage(t.error_rate, (value) => fmtPct(value, 1)), usageHint(`${fmtInt(t.errors)} errored generations`)),
+    tile("Judge p95", usage(judgeP95, fmtMs), usageHint("Frontier verdict latency")),
     tile("Findings", t.findings == null ? "—" : fmtInt(t.findings), d.harness ? "unique, evidenced" : "findings DB not set up"),
-    tile("Cost per finding", fmtUSD(t.cost_per_finding), "the number to drive down"));
+    tile("Cost per finding", usage(t.cost_per_finding, fmtUSD), usageHint("Spend ÷ unique evidenced findings")));
 
   const mk = (metric, title, sub, fmt, kind = "columns") => {
+    if (!usageAvailable) return card(title, sub, h("p", { class: "muted small" }, "Usage data unavailable."));
     const series = routeSeries(d[metric], routes);
     const draw = (el) => (kind === "lines" ? lines : columns)(el, { ...base, series, fmt, label: title });
     return chartCard({ title, sub, draw, legendItems: series, legendKind: kind === "lines" ? "line" : "rect", tableView: () => seriesTable(d.buckets, d.step, series, fmt) });
@@ -367,13 +410,12 @@ function renderTrends(d) {
 
   const findSeries = [{ name: "Unique findings", color: "var(--s7)", values: d.findings }];
   const findings = chartCard({
-    title: "Unique evidenced findings", sub: d.harness ? `Confirmed by the judge, with a replayable exchange, not a duplicate. ${fmtUSD(t.cost_per_finding)} of LLM spend each.` : "Needs the harness findings DB (db/harness.sql).",
-    draw: (el) => columns(el, { ...base, series: findSeries, fmt: fmtInt, emptyText: d.harness ? "No findings in this range" : "Findings DB not set up" }),
-    tableView: () => seriesTable(d.buckets, d.step, findSeries, fmtInt),
+    title: "Unique evidenced findings", sub: d.harness ? "Confirmed verdicts with evidence, excluding duplicates." : "Findings database unavailable.",
+    draw: (el) => columns(el, { ...base, series: findSeries, fmt: fmtInt, label: "Unique evidenced findings", emptyText: d.harness ? "No findings in this range" : "Findings database unavailable" }),
+    tableView: d.harness ? () => seriesTable(d.buckets, d.step, findSeries, fmtInt) : null,
   });
 
   return [
-    h("p", { class: "lede" }, h("strong", {}, "Is the harness getting cheaper and better? "), "Spend and volume per route tier, latency and errors per route, and the outcome they buy: unique findings. Watch cost per finding fall as the glue tier gets sharper."),
     notices(d.notes),
     tiles,
     h("div", { class: "grid g2" },
@@ -393,12 +435,10 @@ function hbarList(rows, { fmt = fmtInt, color = "var(--accent)" } = {}) {
   return h("div", { class: "hbars", style: { display: "grid", gridTemplateColumns: "minmax(120px, auto) 1fr auto", gap: "8px 12px", alignItems: "center" } },
     rows.map((r) => {
       const bar = h("div", { style: { height: "16px", width: `${Math.max(r.value ? 0.5 : 0, (100 * r.value) / max)}%`, background: r.color || color, borderRadius: "0 4px 4px 0" } });
-      const track = h("div", { tabindex: 0, "aria-label": `${r.label}: ${fmt(r.value)}${r.note ? ", " + r.note : ""}`, style: { minWidth: 0 } }, bar);
+      const track = h("div", { "aria-hidden": "true", style: { minWidth: 0 } }, bar);
       const show = (e) => showTip(e, r.label, [{ color: r.color || color, value: fmt(r.value), label: r.note || "" }]);
       track.addEventListener("pointermove", show);
-      track.addEventListener("focus", show);
       track.addEventListener("pointerleave", hideTip);
-      track.addEventListener("blur", hideTip);
       return [h("div", { class: "ink2", style: { fontSize: "13px" } }, r.label), track, h("div", { class: "num", style: { textAlign: "right", fontSize: "13px", whiteSpace: "nowrap" } }, fmt(r.value), r.note ? h("span", { class: "muted small" }, "  " + r.note) : null)];
     }));
 }
@@ -455,7 +495,7 @@ function renderFlows(d) {
       f.confirmed_no_evidence
         ? h("div", { class: "funnel-note" }, statusIcon("critical"), h("span", {}, h("strong", {}, `${f.confirmed_no_evidence} confirmed without evidence. `), "No evidence, no report: these are blocked from findings until replayed."))
         : h("div", { class: "funnel-note" }, statusIcon("good"), h("span", {}, "Evidence gate clean: every confirmation has a replayable request/response pair.")),
-      verdictTotal ? h("div", { class: "funnel-note" }, statusIcon("unknown"), h("span", {}, `Judge verdicts: ${fmtInt(f.confirmed)} confirmed, ${fmtInt(f.needs_review)} need review, ${fmtInt(f.rejected)} rejected (${fmtPct(f.rejected / verdictTotal)} false-positive escalations from glue).`)) : null);
+      verdictTotal ? h("div", { class: "funnel-note" }, statusIcon("unknown"), h("span", {}, `Judge verdicts: ${fmtInt(f.confirmed)} confirmed, ${fmtInt(f.needs_review)} need review, ${fmtInt(f.rejected)} rejected (${fmtPct(f.rejected / verdictTotal)} of verdicts).`)) : null);
 
     const g = hs.guardrails;
     const ks = hs.kill_switch;
@@ -463,7 +503,7 @@ function renderFlows(d) {
       h("div", { class: "tiles", style: { gridTemplateColumns: "repeat(3, minmax(0, 1fr))" } },
         tile("Scope denied", fmtInt(g.by_kind.scope_denied || 0), "out-of-scope requests dropped"),
         tile("Rate limited", fmtInt(g.by_kind.rate_limited || 0), "per-target ceiling hits"),
-        h("div", { class: "tile" }, h("div", { class: "label" }, "Kill switch"), h("div", { class: "value", style: { fontSize: "18px", marginTop: "6px" } }, badge(!ks ? "unknown" : ks.state === "engaged" ? "warning" : "good", ks ? ks.state : "never used")), h("div", { class: "hint" }, ks ? fmtWhen(ks.at) : ""))),
+        h("div", { class: "tile" }, h("div", { class: "label" }, "Shared stop"), h("div", { class: "value", style: { fontSize: "18px", marginTop: "6px" } }, badge(!ks ? "unknown" : ks.state === "engaged" ? "warning" : "good", ks ? ks.state : "unavailable")), h("div", { class: "hint" }, ks ? `Checked ${fmtWhen(ks.at)}` : ""))),
       table([
         { label: "When", key: "t", fmt: fmtWhen, cls: "nw" },
         { label: "Kind", key: "kind" },
@@ -502,7 +542,6 @@ function renderFlows(d) {
     ], d.runs, { onRow: (r) => (r.tracked ? openRun(r.id) : openDrawer(`Session ${r.id}`, r)), empty: "No runs in this range.", cap: 15 }));
 
   return [
-    h("p", { class: "lede" }, h("strong", {}, "Where does the work and money go? "), "Route tiers from glue to judge, the agent loop's funnel from mapped operations to unique findings, and the guardrails around it."),
     notices(d.notes),
     h("div", { class: "stack" }, flowCard, h("div", { class: "grid g2" }, funnelCard, guardCard), stepsCard, runsCard),
   ];
@@ -539,11 +578,12 @@ const sevCell = (r) => (r.severity ? h("span", { class: "cell-key" }, h("span", 
 const linkTo = (url, text) => (url ? h("a", { href: url, target: "_blank", rel: "noopener noreferrer", onclick: (e) => e.stopPropagation() }, text) : null);
 
 function drawerSection(title, ...kids) {
-  return h("section", { class: "d-sec" }, h("h4", {}, title), ...kids);
+  return h("section", { class: "d-sec" }, h("h3", {}, title), ...kids);
 }
 
 function openFinding(r) {
-  if (state.run) { state.run = null; writeHash(); }
+  runRequest?.abort();
+  if (state.run) { state.run = null; writeHash({ replace: true }); }
   const body = h("div", {},
     h("div", { class: "d-badges" }, labelBadge(r), r.lab ? gtCell(r) : null),
     drawerSection("Where", kv([["Endpoint", `${r.method} ${r.path}`], ["Target", r.target], ["Run", r.run_id], ["Run status", r.run_status]]),
@@ -558,14 +598,20 @@ function openFinding(r) {
   openDrawer(`Verdict ${r.id} · ${r.method} ${r.path}`, body);
 }
 
+let runRequest;
 async function openRun(id) {
+  runRequest?.abort();
+  const request = new AbortController();
+  runRequest = request;
   state.run = id;
-  writeHash(); // shareable: #/eval?range=7d&run=<id>
-  openDrawer(`Run ${id}`, h("p", { class: "muted small", style: { padding: "16px" } }, "Loading…"));
+  writeHash({ replace: true }); // include the run in a shared URL
+  openDrawer(`Run ${id}`, h("p", { class: "muted small drawer-message", role: "status" }, "Loading run…"));
   let d;
   try {
-    d = await api(`/api/run/${encodeURIComponent(id)}`);
+    d = await api(`/api/run/${encodeURIComponent(id)}`, { signal: request.signal });
+    request.signal.throwIfAborted();
   } catch (e) {
+    if (request.signal.aborted || !$("#drawer").open) return;
     openDrawer(`Run ${id}`, h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, e.message)));
     return;
   }
@@ -647,8 +693,7 @@ function download(name, text, type) {
 }
 
 function renderFindings(d) {
-  const lede = h("p", { class: "lede" }, h("strong", {}, "What did the harness find? "), "Every confirmed and needs-review verdict, joined to its endpoint, probe identity, evidence and judge trace. On lab targets each one is checked against the ground truth.");
-  if (!d.available) return [lede, h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, d.error || "Findings DB unavailable."))];
+  if (!d.available) return h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, d.error || "Findings DB unavailable."));
   const t = d.totals;
   const tiles = h("div", { class: "tiles" },
     tile("Findings", fmtInt(t.findings), `confirmed, evidenced, unique · ${RANGE_LABEL[d.range]}`, true),
@@ -672,14 +717,18 @@ function renderFindings(d) {
   state.ffilter = state.ffilter || "findings";
   const holder = h("div", {});
   const search = h("input", { type: "search", class: "search", placeholder: "Filter by path, target, run, identity…", "aria-label": "Filter verdicts", value: state.fq || "" });
-  const chips = h("div", { class: "chips" });
+  const chips = h("div", { class: "chips", role: "group", "aria-label": "Verdict filters" });
+  const resultCount = h("p", { class: "result-count small muted", role: "status" });
   const visible = () => {
     const pred = (FILTERS.find((f) => f[0] === state.ffilter) || FILTERS[0])[2];
     const q = (state.fq || "").toLowerCase().trim();
     return d.rows.filter(pred).filter((r) => !q || [r.method, r.path, r.target, r.run_id, r.identity, r.tenant, r.role, r.intent, r.gt_id, r.severity].some((v) => v && String(v).toLowerCase().includes(q)));
   };
   const draw = () => {
-    chips.replaceChildren(...FILTERS.map(([k, label, pred]) => h("button", { class: "chip", "aria-pressed": String(state.ffilter === k), onclick: () => { state.ffilter = k; draw(); } }, `${label} · ${fmtInt(d.rows.filter(pred).length)}`)));
+    for (const chip of chips.children) chip.setAttribute("aria-pressed", String(chip.dataset.filter === state.ffilter));
+    const rows = visible();
+    resultCount.textContent = `${fmtInt(rows.length)} matching verdict${rows.length === 1 ? "" : "s"}`;
+    exportBtn.disabled = !rows.length;
     holder.replaceChildren(table([
       { label: "Judged", key: "judged_at", fmt: fmtWhen, cls: "nw" },
       { label: "Status", render: labelBadge },
@@ -690,17 +739,18 @@ function renderFindings(d) {
       { label: "Intent", key: "intent", cls: "clip", title: (r) => r.intent || "" },
       { label: "Ground truth", render: gtCell },
       { label: "", cls: "nw", render: (r) => linkTo(r.trace_link, "Trace ↗") || "—" },
-    ], visible(), { onRow: openFinding, empty: "No verdicts match.", cap: 50 }));
+    ], rows, { onRow: openFinding, empty: "No verdicts match.", cap: 50 }));
   };
+  chips.append(...FILTERS.map(([k, label, pred]) => h("button", { class: "chip", "data-filter": k, onclick: () => { state.ffilter = k; draw(); } }, `${label} · ${fmtInt(d.rows.filter(pred).length)}`)));
   search.addEventListener("input", () => { state.fq = search.value; draw(); });
-  draw();
   const exportBtn = h("button", { class: "btn", onclick: () => download(`harness-verdicts-${d.range}.csv`,
     csv(visible().map((r) => ({ ...r, judged_at: r.judged_at ? new Date(r.judged_at * 1000).toISOString() : "" })), CSV_COLS), "text/csv") }, "Export CSV");
+  draw();
 
   const list = h("div", { class: "card" },
-    h("div", { class: "card-head" }, h("div", {}, h("h3", {}, "Verdicts"), h("p", { class: "sub" }, "Newest first. Click a row for the probe, evidence refs, ground-truth match and run.")), h("div", { class: "actions" }, exportBtn)),
-    h("div", { class: "toolbar" }, search), chips, holder);
-  return [lede, tiles, h("div", { class: "stack" }, h("div", { class: "grid g2" }, sevCard, epCard), list)];
+    h("div", { class: "card-head" }, h("div", {}, h("h2", {}, "Verdicts"), h("p", { class: "sub" }, "Newest first. Open a row for evidence and run details.")), h("div", { class: "actions" }, exportBtn)),
+    h("div", { class: "toolbar" }, search), chips, resultCount, holder);
+  return [tiles, h("div", { class: "stack" }, h("div", { class: "grid g2" }, sevCard, epCard), list)];
 }
 
 // ================================================================= EVAL
@@ -720,26 +770,25 @@ function matrix(t) {
     return h("td", { class: "mx " + (f.group === "authz" ? "miss" : "na"), title: `${c.id}: not found` }, f.group === "authz" ? "○" : "·");
   };
   const unmatched = (c) => c.counts.unmatched + Object.keys(c.fps).filter((k) => !rows.some((r) => r.id === k)).reduce((a, k) => a + c.fps[k], 0);
-  return h("div", { class: "table-wrap" }, h("table", { class: "data matrix" },
+  return h("div", { class: "table-wrap", tabindex: 0, role: "group", "aria-label": "Scrollable coverage matrix" }, h("table", { class: "data matrix" },
     h("thead", {}, h("tr", {}, h("th", {}, "Ground truth"), cols.map((c) => h("th", { class: "mx-h" },
       h("button", { class: "link-btn", title: `${c.id} · ${c.twin} twin · ${fmtWhen(c.started_at)}`, onclick: () => openRun(c.id) }, df.format(new Date((c.started_at || 0) * 1000)), c.twin === "control" ? h("span", { class: "tag" }, "ctl") : null))))),
     h("tbody", {},
       rows.map((f) => h("tr", { class: f.group === "authz" ? "" : "muted-row" },
-        h("td", { class: "nw" }, h("span", { class: "mono" }, f.group === "negative" ? f.endpoint : f.id), f.group !== "authz" ? h("span", { class: "tag" }, f.group === "negative" ? "negative" : "other") : null, !f.matchable && f.group !== "negative" ? h("span", { class: "tag" }, "manual") : null),
+        h("th", { scope: "row", class: "nw" }, h("span", { class: "mono" }, f.group === "negative" ? f.endpoint : f.id), f.group !== "authz" ? h("span", { class: "tag" }, f.group === "negative" ? "negative" : "other") : null, !f.matchable && f.group !== "negative" ? h("span", { class: "tag" }, "manual") : null),
         cols.map((c) => cell(f, c)))),
       h("tr", { class: "muted-row" }, h("td", {}, "Unmatched / other FPs"), cols.map((c) => { const n = unmatched(c); return h("td", { class: "mx " + (n ? (c.twin === "control" ? "bad" : "warn") : "na") }, n ? String(n) : "·"); })))));
 }
 
 function renderEval(d) {
-  const lede = h("p", { class: "lede" }, h("strong", {}, "Is the harness actually right? "), "Runs against the offline lab scored on the ground truth in ", h("code", {}, "lab/ground-truth/"), ": recall on authz bugs, false positives on negatives and VAmPI's secure twin, and cost per confirmed bug. Re-run after every prompt, model or router change.");
   if (!d.available) {
-    return [lede, h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, d.error || "Unavailable.")),
+    return [h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, d.error || "Unavailable.")),
       ...(d.errors || []).map((e) => h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, e)))];
   }
-  const out = [lede, notices(d.notes), ...(d.errors || []).map((e) => h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, `Ground truth: ${e}`)))];
+  const out = [notices(d.notes), ...(d.errors || []).map((e) => h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, `Ground truth: ${e}`)))];
   const cards = d.targets.map((t) => {
     const L = t.latest;
-    const head = h("div", { class: "card-head" }, h("div", {}, h("h3", {}, t.name), h("p", { class: "sub mono" }, [t.source, t.base_url, t.control_url ? `control ${t.control_url}` : null].filter(Boolean).join(" · "))),
+    const head = h("div", { class: "card-head" }, h("div", {}, h("h2", {}, t.name), h("p", { class: "sub mono" }, [t.source, t.base_url, t.control_url ? `control ${t.control_url}` : null].filter(Boolean).join(" · "))),
       h("div", { class: "actions" }, h("span", { class: "muted small" }, `${t.scorable} of ${t.authz} authz bugs auto-scorable`)));
     if (!t.runs) {
       return h("div", { class: "card" }, head, h("p", { class: "muted small" }, `No runs against ${t.name} in this range. Write harness.runs.target as its base URL (e.g. ${t.base_url}) or a name like "${t.name}"${t.control_url ? ` / "${t.name}-control"` : ""}.`));
@@ -755,13 +804,13 @@ function renderEval(d) {
       tile("Runs scored", fmtInt(t.runs), t.control_url ? "vulnerable + control" : "vulnerable"));
     const series = t.recall_series.filter((x) => x.recall != null);
     const chart = series.length > 1 ? chartCard({
-      title: "Recall per run", sub: "Vulnerable twin, oldest to newest. Hover for the run.",
+      title: "Recall per run", heading: "h3", sub: "Vulnerable twin, oldest to newest.",
       draw: (el) => lines(el, { buckets: series.map((x) => x.t), series: [{ name: "Recall", color: "var(--s3)", values: series.map((x) => x.recall) }], fmt: (v) => fmtPct(v), fmtX: (x) => df.format(new Date(x * 1000)), titleX: (x) => fmtWhen(x), label: `${t.name} recall per run`, height: 160 }),
       tableView: () => table([{ label: "Run", render: (x) => h("span", { class: "mono" }, x.id) }, { label: "Started", key: "t", fmt: fmtWhen }, { label: "Recall", key: "recall", fmt: (v) => fmtPct(v), align: "r" }], [...series].reverse(), { onRow: (x) => openRun(x.id) }),
     }) : null;
     return h("div", { class: "card" }, head, tiles,
       chart ? h("div", { class: "eval-chart" }, chart) : null,
-      h("h4", { class: "mx-title" }, "Coverage, last ", String(t.columns.length), " runs"),
+      h("h3", { class: "mx-title" }, "Coverage, last ", String(t.columns.length), " runs"),
       h("p", { class: "sub small muted" }, "✓ found · ○ missed authz bug · ✗ false positive · · should stay clean / not counted · ? needs manual scoring. Click a date to open the run."),
       matrix(t));
   });
@@ -794,14 +843,17 @@ const SQL_EXAMPLES = [
   ["Paths with most confirmations", "select o.method, o.path, count(*) as confirmed\nfrom harness.verdicts v\njoin harness.probes p on p.id = v.probe_id\njoin harness.operations o on o.id = p.op_id\nwhere v.label = 'confirmed' group by 1, 2 order by 3 desc limit 20"],
 ];
 
+let drawerTrigger;
 function openDrawer(title, obj) {
+  const drawer = $("#drawer");
+  if (!drawer.open) drawerTrigger = document.activeElement;
   $("#drawer-title").textContent = title;
   const body = $("#drawer-body");
   body.scrollTop = 0;
   body.replaceChildren(obj instanceof Node ? obj : h("pre", {}, typeof obj === "string" ? obj : JSON.stringify(obj, null, 2)));
-  const wasOpen = !$("#drawer").hidden;
-  $("#drawer").hidden = false;
-  if (!wasOpen) $("#drawer-close").focus();
+  hideTip();
+  if (!drawer.open) drawer.showModal();
+  else if (!drawer.contains(document.activeElement)) $("#drawer-close").focus();
 }
 
 function pager(page, pages, go, more) {
@@ -814,10 +866,10 @@ function pager(page, pages, go, more) {
 
 const ext = (url) => (url ? h("a", { href: url, target: "_blank", rel: "noopener noreferrer", onclick: (e) => e.stopPropagation() }, "Langfuse ↗") : "—");
 
-async function renderRaw() {
-  const sub = h("div", { class: "subnav", role: "toolbar", "aria-label": "Raw data source" }, RAW_TABS.map(([k, label]) =>
-    h("button", { "aria-pressed": String(state.raw === k), onclick: () => { state.raw = k; state.page = 1; state.cursors = [null]; writeHash(); render(); } }, label)));
-  const out = [h("p", { class: "lede" }, h("strong", {}, "The records behind every chart. "), "Read-only. Click a row for the full record. Long bodies are trimmed; Langfuse holds the originals."), sub];
+async function renderRaw(get) {
+  const sub = h("div", { class: "subnav", role: "group", "aria-label": "Raw data source" }, RAW_TABS.map(([k, label]) =>
+    h("button", { "data-raw": k, "aria-pressed": String(state.raw === k), onclick: () => { state.raw = k; resetPages(); writeHash(); render({ focusRaw: true }); } }, label)));
+  const out = [sub];
   const range = state.range;
   const go = (p) => { state.page = p; render(); };
   // Langfuse v2 pages by cursor: remember the cursor that opens each page
@@ -828,7 +880,7 @@ async function renderRaw() {
   const emptyPage = (d) => (d.next ? "No rows on this page; Langfuse pages can be sparse. Try Next." : "Nothing in this range.");
 
   if (state.raw === "generations") {
-    const d = await api(`/api/raw/generations?range=${range}${cq}`);
+    const d = await get(`/api/raw/generations?range=${range}${cq}`);
     out.push(card(`Generations · ${RANGE_LABEL[range]}`, "Every LLM call LiteLLM exported to Langfuse, newest first, 50 per page.",
       table([
         { label: "Time", key: "ts", fmt: fmtWhen, cls: "nw" },
@@ -840,13 +892,11 @@ async function renderRaw() {
         { label: "Out", key: "out_tok", fmt: fmtInt, align: "r" },
         { label: "Cost", key: "cost", fmt: fmtUSD, align: "r" },
         { label: "Level", render: (r) => (r.level === "ERROR" ? badge("critical", "error") : r.level === "WARNING" ? badge("warning", "warning") : h("span", { class: "muted" }, "ok")) },
-        { label: "Input", key: "input", cls: "clip", title: (r) => r.input },
-        { label: "Output", key: "output", cls: "clip", title: (r) => r.output || r.status || "" },
         { label: "", render: (r) => ext(r.link) },
       ], d.rows, { onRow: (r) => openDrawer(`Generation ${r.id}`, r.raw), empty: emptyPage(d) }),
       cursorPager(d)));
   } else if (state.raw === "traces") {
-    const d = await api(`/api/raw/traces?range=${range}${cq}`);
+    const d = await get(`/api/raw/traces?range=${range}${cq}`);
     out.push(card(`Traces · ${RANGE_LABEL[range]}`, "Root observation of each trace (Langfuse v4 has no trace list). Session = harness run id.",
       table([
         { label: "Time", key: "ts", fmt: fmtWhen, cls: "nw" },
@@ -855,17 +905,16 @@ async function renderRaw() {
         { label: "Type", key: "type" },
         { label: "Latency", key: "latency_ms", fmt: fmtMs, align: "r" },
         { label: "Cost", key: "cost", fmt: fmtUSD, align: "r" },
-        { label: "Input", key: "input", cls: "clip", title: (r) => r.input },
         { label: "", render: (r) => ext(r.link) },
       ], d.rows, { onRow: (r) => openDrawer(`Trace ${r.id}`, r.raw), empty: emptyPage(d) }),
       cursorPager(d)));
   } else if (state.raw === "tables") {
-    const t = await api("/api/raw/tables");
-    if (!t.available) {
-      out.push(card("Harness tables", null, h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, t.error))));
+    const t = await get("/api/raw/tables");
+    if (!t.available || !t.tables?.length) {
+      out.push(card("Harness tables", null, h("div", { class: "notice" }, statusIcon("unknown"), h("span", {}, t.error || "No database tables available."))));
     } else {
       if (!state.table) state.table = t.tables[0].name;
-      const d = await api(`/api/raw/table/${encodeURIComponent(state.table)}?page=${state.page}`);
+      const d = await get(`/api/raw/table/${encodeURIComponent(state.table)}?page=${state.page}`);
       const cols = d.columns.map((c) => ({ label: c, cls: "clip", render: (r) => { const v = r[c]; return v == null ? h("span", { class: "muted" }, "null") : typeof v === "object" ? JSON.stringify(v) : String(v); }, title: (r) => (r[c] == null ? "" : typeof r[c] === "object" ? JSON.stringify(r[c]) : String(r[c])) }));
       out.push(h("div", { class: "raw-split" },
         h("div", { class: "card" }, h("nav", { class: "list-nav", "aria-label": "Tables" }, t.tables.map((x) =>
@@ -875,14 +924,14 @@ async function renderRaw() {
           pager(d.page, null, go, d.more))));
     }
   } else if (state.raw === "qdrant") {
-    const c = await api("/api/raw/qdrant");
+    const c = await get("/api/raw/qdrant");
     if (!c.collections.length) {
       out.push(card("Qdrant", null, h("p", { class: "muted small" }, "No collections yet.")));
     } else {
       if (!state.collection || !c.collections.some((x) => x.name === state.collection)) state.collection = c.collections[0].name;
       state.qOffsets = state.qOffsets || [null];
       const off = state.qOffsets[state.page - 1] ?? null;
-      const d = await api(`/api/raw/qdrant/${encodeURIComponent(state.collection)}${off != null ? `?offset=${encodeURIComponent(off)}` : ""}`);
+      const d = await get(`/api/raw/qdrant/${encodeURIComponent(state.collection)}${off != null ? `?offset=${encodeURIComponent(off)}` : ""}`);
       state.qOffsets[state.page] = d.next;
       out.push(h("div", { class: "raw-split" },
         h("div", { class: "card" }, h("nav", { class: "list-nav", "aria-label": "Collections" }, c.collections.map((x) =>
@@ -923,66 +972,217 @@ async function renderRaw() {
 
 // ================================================================= render loop
 
-let seq = 0;
-async function render() {
-  const my = ++seq;
-  for (const t of TABS) {
-    $(`#tab-${t}`).hidden = t !== state.tab;
-    document.querySelector(`.tabs [data-tab="${t}"]`).setAttribute("aria-selected", String(t === state.tab));
+const RENDERERS = { health: renderHealth, trends: renderTrends, flows: renderFlows, findings: renderFindings, eval: renderEval };
+const snapshots = new WeakMap();
+let viewRequest;
+
+function replaceView(section, ...nodes) {
+  for (const chart of section.querySelectorAll(".chart")) ro.unobserve(chart);
+  section.replaceChildren(...nodes.flat(Infinity).filter(Boolean));
+  for (const chart of section.querySelectorAll(".chart")) {
+    const width = chart.clientWidth;
+    if (width) {
+      widths.set(chart, width);
+      drawers.get(chart)?.();
+    }
+    ro.observe(chart);
   }
-  $("#range").hidden = state.tab === "health";
-  for (const b of $("#range").children) b.setAttribute("aria-checked", String(b.dataset.range === state.range));
-  const sec = $(`#tab-${state.tab}`);
-  $("#main").classList.add("loading");
+}
+
+function syncControls() {
+  const [title, description] = VIEWS[state.tab];
+  $("#view-title").textContent = title;
+  $("#view-description").textContent = description;
+  document.title = title + " · Seccy";
+  for (const button of tabButtons) {
+    const selected = button.dataset.tab === state.tab;
+    const panel = document.getElementById(button.getAttribute("aria-controls"));
+    panel.hidden = !selected;
+    if (!selected) panel.removeAttribute("aria-busy");
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  }
+  $("#range").hidden = state.tab === "health" || (state.tab === "raw" && !["generations", "traces"].includes(state.raw));
+  $("#auto-control").hidden = state.tab === "raw";
+  $("#stack-pill").hidden = state.tab !== "health" || !snapshots.has($("#tab-health"));
+  for (const input of $("#range").querySelectorAll("input")) input.checked = input.value === state.range;
+}
+
+function resetPages() {
+  state.page = 1;
+  state.cursors = [null];
+  state.qOffsets = [null];
+}
+
+async function render({ background = false, focusRaw = false } = {}) {
+  viewRequest?.abort();
+  const request = new AbortController();
+  viewRequest = request;
+  const { signal } = request;
+  const { tab, range, raw, page, table, collection } = state;
+  const section = $(`#tab-${tab}`);
+  const key = JSON.stringify(tab === "health" ? [tab] : tab === "raw" ? [tab, range, raw, page, table, collection] : [tab, range]);
+  const previous = snapshots.get(section);
+  const stale = previous?.key === key;
+  const status = $("#updated");
+  const loadState = $("#load-state");
+  const restoreRawFocus = focusRaw && section.contains(document.activeElement);
+  syncControls();
+  hideTip();
+  loadState.replaceChildren();
+  section.setAttribute("aria-busy", "true");
+  if (!stale) {
+    snapshots.delete(section);
+    replaceView(section);
+  }
+  if (!background || !stale) status.textContent = stale ? "Refreshing…" : "Loading…";
+  const get = async (path) => {
+    const result = await api(path, { signal });
+    signal.throwIfAborted();
+    return result;
+  };
   try {
     let nodes;
-    if (state.tab === "health") nodes = renderHealth(await api("/api/health"));
-    else if (state.tab === "trends") nodes = renderTrends(await api(`/api/trends?range=${state.range}`));
-    else if (state.tab === "flows") nodes = renderFlows(await api(`/api/flows?range=${state.range}`));
-    else if (state.tab === "findings") nodes = renderFindings(await api(`/api/findings?range=${state.range}`));
-    else if (state.tab === "eval") nodes = renderEval(await api(`/api/eval?range=${state.range}`));
-    else nodes = await renderRaw();
-    if (my !== seq) return;
-    for (const el of sec.querySelectorAll(".chart")) { ro.unobserve(el); drawers.delete(el); }
-    sec.replaceChildren(...[nodes].flat(Infinity).filter(Boolean));
-    $("#updated").textContent = `Updated ${tf.format(new Date())}`;
+    let at;
+    if (tab === "raw") {
+      await metadata;
+      signal.throwIfAborted();
+      nodes = await renderRaw(get);
+    } else {
+      const [data] = await Promise.all([get(tab === "health" ? "/api/health" : `/api/${tab}?range=${range}`), metadata]);
+      signal.throwIfAborted();
+      nodes = RENDERERS[tab](data);
+      if (tab === "health") {
+        at = data.at;
+        updatePill(data);
+      }
+    }
+    signal.throwIfAborted();
+    const loaded = Date.now() / 1000;
+    snapshots.set(section, {
+      key: tab === "raw" ? JSON.stringify([tab, range, raw, page, state.table, state.collection]) : key,
+      loaded,
+    });
+    replaceView(section, nodes);
+    status.textContent = at ? `Service snapshot · ${fmtWhen(at)}` : `Loaded ${tf.format(new Date(loaded * 1000))}`;
+    if (restoreRawFocus) section.querySelector(`[data-raw="${raw}"]`)?.focus();
   } catch (e) {
-    if (my !== seq) return;
-    sec.replaceChildren(h("div", { class: "notice" }, statusIcon("critical"), h("span", { class: "error" }, `Could not load: ${e.message}`)));
+    if (signal.aborted) return;
+    status.textContent = stale ? `Showing last successful load · ${fmtWhen(previous.loaded)}` : "Data unavailable";
+    const retry = h("button", { class: "btn", onclick: () => { $("#refresh").focus(); render(); } }, "Retry");
+    loadState.replaceChildren(h("div", { class: "notice load-notice" },
+      h("span", { class: "error", role: "alert" }, stale ? "Refresh failed. " : "Could not load this view. ", e.message), retry));
+    if (restoreRawFocus) retry.focus();
   } finally {
-    if (my === seq) $("#main").classList.remove("loading");
+    if (!signal.aborted) {
+      section.removeAttribute("aria-busy");
+      viewRequest = null;
+    }
   }
-  if (state.tab !== "health") api("/api/health").then((d) => updatePill(d.services)).catch(() => {});
 }
 
 function schedule() {
   clearInterval(state.timer);
-  // skip a tick while someone is typing in a filter box, or the redraw steals focus
-  const typing = () => document.activeElement?.matches?.("#main input, #main textarea");
-  if ($("#auto").checked) state.timer = setInterval(() => { if (state.tab !== "raw" && document.visibilityState === "visible" && !typing()) render(); }, 30000);
+  if (!$("#auto").checked) return;
+  state.timer = setInterval(() => {
+    const interacting = document.activeElement?.closest(".tab");
+    if (state.tab !== "raw" && document.visibilityState === "visible" && !interacting
+        && !$("#drawer").open && !viewRequest && $("#tooltip").hidden) {
+      render({ background: true });
+    }
+  }, 30000);
 }
 
-async function init() {
+function closeDrawer({ restoreFocus = true, updateHash = true } = {}) {
+  const drawer = $("#drawer");
+  if (!drawer.open) return;
+  runRequest?.abort();
+  if (updateHash && state.run) {
+    state.run = null;
+    writeHash({ replace: true });
+  }
+  drawer.close();
+  $("#drawer-body").replaceChildren();
+  if (restoreFocus) {
+    const trigger = drawerTrigger?.isConnected && !drawerTrigger.closest("[hidden]") ? drawerTrigger : $(`#nav-${state.tab}`);
+    trigger.focus();
+  }
+  drawerTrigger = null;
+}
+
+let metadata;
+function init() {
   readHash();
-  try {
-    state.meta = await api("/api/meta");
-    ROUTES = state.meta.routes;
-    $("#demo-banner").hidden = !state.meta.demo;
-  } catch { /* render() will surface the error */ }
+  metadata = api("/api/meta", { signal: AbortSignal.timeout(10000) }).then((meta) => {
+    if (Array.isArray(meta.routes)) ROUTES = meta.routes;
+    $("#demo-banner").hidden = !meta.demo;
+  }).catch(() => { /* View-specific requests still report their own errors. */ });
+
   const seg = $("#range");
-  for (const r of ["24h", "7d", "30d", "90d"]) {
-    seg.append(h("button", { role: "radio", "data-range": r, onclick: () => { state.range = r; state.page = 1; state.cursors = [null]; state.qOffsets = [null]; writeHash(); render(); } }, r));
+  for (const r of Object.keys(RANGE_LABEL)) {
+    seg.append(
+      h("input", { type: "radio", name: "range", id: `range-${r}`, value: r, onchange: () => {
+        state.range = r;
+        resetPages();
+        writeHash();
+        render();
+      } }),
+      h("label", { for: `range-${r}` }, r));
   }
-  for (const b of document.querySelectorAll(".tabs button")) {
-    b.addEventListener("click", () => { state.tab = b.dataset.tab; state.page = 1; state.cursors = [null]; writeHash(); render(); });
+
+  for (const button of tabButtons) {
+    button.addEventListener("click", () => {
+      if (state.tab === button.dataset.tab) return;
+      state.tab = button.dataset.tab;
+      resetPages();
+      writeHash();
+      render();
+    });
   }
-  $("#refresh").addEventListener("click", render);
+  $(".tabs").addEventListener("keydown", (e) => {
+    const i = tabButtons.indexOf(e.target);
+    if (i < 0) return;
+    const targets = { ArrowLeft: (i - 1 + tabButtons.length) % tabButtons.length,
+      ArrowRight: (i + 1) % tabButtons.length, Home: 0, End: tabButtons.length - 1 };
+    if (!Object.hasOwn(targets, e.key)) return;
+    e.preventDefault();
+    tabButtons[i].tabIndex = -1;
+    const next = tabButtons[targets[e.key]];
+    next.tabIndex = 0;
+    next.focus();
+  });
+  $(".tabs").addEventListener("focusout", (e) => {
+    if (e.currentTarget.contains(e.relatedTarget)) return;
+    for (const button of tabButtons) button.tabIndex = button.dataset.tab === state.tab ? 0 : -1;
+  });
+
+  $(".skip-link").addEventListener("click", (e) => {
+    e.preventDefault();
+    $("#view-title").focus();
+  });
+  $("#refresh").addEventListener("click", () => render());
   $("#auto").addEventListener("change", schedule);
-  const closeDrawer = () => { $("#drawer").hidden = true; if (state.run) { state.run = null; writeHash(); } };
-  $("#drawer-close").addEventListener("click", closeDrawer);
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
-  window.addEventListener("hashchange", () => { readHash(); render(); });
-  writeHash();
+  $("#drawer-close").addEventListener("click", () => closeDrawer());
+  $("#drawer").addEventListener("cancel", (e) => { e.preventDefault(); closeDrawer(); });
+  $("#drawer").addEventListener("keydown", (e) => {
+    if (e.key !== "Tab") return;
+    const focusable = [...e.currentTarget.querySelectorAll("button, a[href], [tabindex], input, textarea, select")]
+      .filter((el) => el.tabIndex >= 0 && !el.disabled && el.getClientRects().length);
+    const edge = e.shiftKey ? focusable[0] : focusable.at(-1);
+    if (document.activeElement !== edge) return;
+    e.preventDefault();
+    (e.shiftKey ? focusable.at(-1) : focusable[0]).focus();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideTip(); });
+  window.addEventListener("hashchange", () => {
+    closeDrawer({ restoreFocus: false, updateHash: false });
+    readHash();
+    resetPages();
+    render();
+    if (state.run) openRun(state.run);
+  });
+
+  writeHash({ replace: true });
   schedule();
   render();
   if (state.run) openRun(state.run);

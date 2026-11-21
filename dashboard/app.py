@@ -11,7 +11,7 @@ import binascii
 import logging
 import os
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import httpx
@@ -21,7 +21,7 @@ from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from backend import RANGES, Backend
+from backend import RANGES, Backend, err_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dashboard")
@@ -36,16 +36,20 @@ if DEMO:
 else:
     backend = Backend()
 
-if not PASSWORD:
-    log.warning("DASHBOARD_PASSWORD is empty: the dashboard is open to anyone who can reach it")
-
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if not PASSWORD and not DEMO:
+        await backend.close()
+        raise RuntimeError("DASHBOARD_PASSWORD is required in live mode")
     task = asyncio.create_task(backend.poll_forever())
-    yield
-    task.cancel()
-    await backend.close()
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        await backend.close()
 
 
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -53,6 +57,8 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
+    if not PASSWORD and not DEMO and request.url.path != "/healthz":
+        return JSONResponse({"error": "dashboard authentication unavailable"}, status_code=503)
     if PASSWORD and request.url.path != "/healthz":
         ok = False
         h = request.headers.get("authorization", "")
@@ -76,10 +82,8 @@ async def basic_auth(request: Request, call_next):
 
 def _err(status: int):
     async def handler(_: Request, e: Exception):
-        msg = str(e).strip().split("\n")[0][:300]
-        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 401:
-            msg = f"{e.request.url.host} rejected the credentials (401). Check LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY."
-        return JSONResponse({"error": msg if status == 400 else f"{type(e).__name__}: {msg}"}, status_code=status)
+        message = "Invalid request or upstream data" if status == 400 else err_text(e)
+        return JSONResponse({"error": message}, status_code=status)
     return handler
 
 
