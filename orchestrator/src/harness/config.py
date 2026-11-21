@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -16,8 +17,12 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 
 def _split(name: str, default: str) -> list[str]:
-    raw = _env(name, default) or ""
+    raw = os.environ.get(name, default)
     return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+REPO = Path(__file__).resolve().parents[3]
+LAB_HOST = "100.102.105.11"
 
 
 @dataclass(frozen=True)
@@ -34,12 +39,14 @@ class Config:
     # host:port entries the harness is permitted to touch. Anything else is
     # dropped and logged. Defaults to the VAmPI lab twins only.
     scope_allowlist: list[str] = field(
-        default_factory=lambda: _split("HARNESS_SCOPE_ALLOWLIST", "100.102.105.11:5061,100.102.105.11:5062")
+        default_factory=lambda: _split("HARNESS_SCOPE_ALLOWLIST", f"{LAB_HOST}:5061,{LAB_HOST}:5062")
     )
     rate_limit_rps: float = field(default_factory=lambda: float(_env("HARNESS_RATE_LIMIT_RPS", "4") or "4"))
-    kill_switch_file: str = field(default_factory=lambda: _env("HARNESS_KILL_SWITCH", ".kill") or ".kill")
+    kill_switch_file: str = field(
+        default_factory=lambda: str(REPO / (_env("HARNESS_KILL_SWITCH", ".kill") or ".kill"))
+    )
 
-    # --- persistence (all optional; the run scores without them) ---
+    # --- shared live dispatch policy and persistence ---
     database_url: str | None = field(default_factory=lambda: _env("HARNESS_DATABASE_URL"))
     qdrant_url: str | None = field(default_factory=lambda: _env("QDRANT_URL"))
     artifacts_dir: str = field(default_factory=lambda: _env("HARNESS_ARTIFACTS_DIR", "artifacts") or "artifacts")

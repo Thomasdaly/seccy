@@ -47,8 +47,15 @@ case "$cmd" in
     ;;
   errors)
     svc=${1:-}; n=${2:-500}
-    # shellcheck disable=SC2086
-    dc logs --tail "$n" $svc 2>&1 | grep -E 'ERROR|WARN|Traceback|Exception|FATAL|panic' | tail -40 || echo "no errors in last $n lines"
+    args=(logs --tail "$n")
+    [ -z "$svc" ] || args+=("$svc")
+    lines=$(dc "${args[@]}" 2>&1) || { printf '%s\n' "$lines" >&2; exit 1; }
+    matches=$(printf '%s\n' "$lines" | awk '/ERROR|WARN|Traceback|Exception|FATAL|panic/' | tail -40)
+    if [ -n "$matches" ]; then
+      printf '%s\n' "$matches"
+    else
+      echo "no errors in last $n lines"
+    fi
     ;;
   exec)
     [ $# -ge 2 ] || { usage; exit 2; }
@@ -60,11 +67,15 @@ case "$cmd" in
     dc restart "$@" 2>&1 | tail -n "$#"
     ;;
   up)
-    on_box "docker compose up -d --build --quiet-pull $* 2>&1 | grep -vE '^ *(=>|#[0-9]+|\[\+\])' | tail -20"
+    services=""
+    if [ "$#" -gt 0 ]; then
+      printf -v services ' %q' "$@"
+    fi
+    on_box "docker compose up -d --build --quiet-pull$services"
     "$0" status
     ;;
   deploy)
-    git push "$HOST" HEAD:master 2>&1 | grep -vE '^(To |remote: *$)' || true
+    git push "$HOST" HEAD:master
     "$0" up "$@"
     ;;
   sh)

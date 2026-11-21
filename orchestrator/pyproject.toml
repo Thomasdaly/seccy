@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 harness = "harness:main"
+harness-archive-review = "harness.review_archive:main"
 
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]

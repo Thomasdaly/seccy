@@ -1,15 +1,9 @@
-"""Persistence. Two independent sinks, both optional:
-
-- Artifact store (always on): the replayable request/response evidence for each
-  probe, written as JSON under artifacts/<run_id>/. evidence_ref points here.
-- Findings DB (if HARNESS_DATABASE_URL is set): the harness.* schema the
-  dashboard reads (runs -> operations -> probes -> exchanges -> verdicts, plus
-  guardrail_events). Tagged with the run id so the dashboard joins Langfuse
-  spend to the run. If no DB is configured the run still scores and reports.
-"""
+"""Private review artifacts and optional findings-database persistence."""
 from __future__ import annotations
 
 import json
+import os
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,49 +17,51 @@ except Exception:  # psycopg optional at import time
 class ArtifactStore:
     def __init__(self, base_dir: str, run_id: str):
         self.dir = Path(base_dir) / run_id
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.dir.mkdir(mode=0o700)
 
     def write_evidence(self, probe_id: str, payload: dict) -> str:
         path = self.dir / f"{probe_id}.json"
-        path.write_text(json.dumps(payload, indent=2, default=str))
+        data = json.dumps(payload, indent=2)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(data)
         return str(path)
 
 
 class FindingsDB:
-    """Thin writer for the harness schema. No-op-safe: construct with None to
-    disable. All writes are best-effort and never crash a run."""
+    """Optional writer. A configured database must accept its writes."""
 
     def __init__(self, database_url: str | None):
-        self.enabled = bool(database_url) and psycopg is not None
-        self._url = database_url
         self._conn = None
-        if self.enabled:
+        if database_url:
+            if psycopg is None:
+                raise RuntimeError("database configured but Psycopg is unavailable")
             try:
-                self._conn = psycopg.connect(self._url, autocommit=True)
-            except Exception as e:
-                print(f"[store] DB disabled ({type(e).__name__}: {e})")
-                self.enabled = False
+                self._conn = psycopg.connect(database_url, autocommit=True, connect_timeout=5)
+            except psycopg.Error:
+                raise RuntimeError("could not connect to findings database") from None
 
     def close(self) -> None:
-        if self._conn:
+        if self._conn is not None:
             self._conn.close()
 
+    def transaction(self):
+        return self._conn.transaction() if self._conn is not None else nullcontext()
+
     def _exec(self, sql: str, params: tuple = ()) -> Any:
-        if not self.enabled:
+        if self._conn is None:
             return None
         try:
             with self._conn.cursor() as cur:
                 cur.execute(sql, params)
-                if cur.description:
-                    return cur.fetchone()
-        except Exception as e:
-            print(f"[store] write skipped ({type(e).__name__}: {e})")
-        return None
+                return cur.fetchone() if cur.description else None
+        except psycopg.Error:
+            raise RuntimeError("findings database write failed") from None
 
     def start_run(self, run_id: str, target: str, program: str) -> None:
         self._exec(
-            "insert into harness.runs (id, target, program, status) values (%s,%s,%s,'running') "
-            "on conflict (id) do nothing",
+            "insert into harness.runs (id, target, program, status) values (%s,%s,%s,'running')",
             (run_id, target, program),
         )
 
@@ -83,7 +79,7 @@ class FindingsDB:
         )
         return row[0] if row else None
 
-    def add_probe(self, op_id: int | None, identity: str, intent: str, interesting: bool) -> int | None:
+    def add_probe(self, op_id: int | None, identity: str, intent: str, interesting: bool | None) -> int | None:
         if op_id is None:
             return None
         row = self._exec(

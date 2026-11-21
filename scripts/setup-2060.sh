@@ -64,8 +64,23 @@ docker compose exec -T postgres psql -U postgres -tAc "SELECT 1 FROM pg_database
 DB_RO=$(grep '^DASHBOARD_DB_PASSWORD=' .env | cut -d= -f2-)
 [ -n "$DB_RO" ] || { echo "set DASHBOARD_DB_PASSWORD in .env"; exit 1; }
 DB_RW=$(grep '^HARNESS_DB_PASSWORD=' .env | cut -d= -f2- || true)   # optional: orchestrator writer role
-docker compose exec -T postgres psql -U postgres -q -v ON_ERROR_STOP=1 -v ro_password="$DB_RO" \
-  ${DB_RW:+-v rw_password="$DB_RW"} < db/harness.sql
+{
+  printf '%s\n' "$DB_RO" "$DB_RW"
+  printf '%s\n' '\getenv ro_password SECCY_PROVISION_RO'
+  if [ -n "$DB_RW" ]; then
+    printf '%s\n' '\getenv rw_password SECCY_PROVISION_RW'
+  fi
+  cat db/harness.sql
+} | docker compose exec -T postgres sh -ec '
+  IFS= read -r SECCY_PROVISION_RO
+  IFS= read -r SECCY_PROVISION_RW
+  export SECCY_PROVISION_RO
+  if [ -n "$SECCY_PROVISION_RW" ]; then
+    export SECCY_PROVISION_RW
+  fi
+  exec psql -U postgres -q -v ON_ERROR_STOP=1
+'
+unset DB_RO DB_RW
 docker compose up -d --build --remove-orphans
 
 step "health (waiting up to 3 min for langfuse + clickhouse migrations)"
@@ -86,18 +101,22 @@ wait_for langfuse "http://$IP:3000/api/public/health"  || fail=1
 wait_for dashboard "http://$IP:8080/healthz"           || fail=1
 
 step "glue route: litellm -> ollama"
-curl -s -m 120 "http://$IP:4000/v1/chat/completions" \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"glue","max_tokens":20,"messages":[{"role":"user","content":"reply with: ok"}]}' \
-  | head -c 400 || fail=1
-echo
+if printf 'Authorization: Bearer %s\n' "$KEY" |
+  curl -fs -o /dev/null -m 120 "http://$IP:4000/v1/chat/completions" \
+    -H @- -H 'Content-Type: application/json' \
+    -d '{"model":"glue","max_tokens":20,"messages":[{"role":"user","content":"reply with: ok"}]}'; then
+  echo "glue: ok"
+else
+  echo "glue: FAILED"; fail=1
+fi
 
 # Also loads bge-m3-cpu: OLLAMA_KEEP_ALIVE=-1 pins a model once loaded but
 # doesn't preload it, so without this embed stays cold after every restart.
 step "embed route: litellm -> ollama (warm-up)"
-if curl -s -m 120 "http://$IP:4000/v1/embeddings" \
-  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"embed","input":"warm-up"}' | grep -q '"embedding"'; then
+if printf 'Authorization: Bearer %s\n' "$KEY" |
+  curl -fs -m 120 "http://$IP:4000/v1/embeddings" \
+    -H @- -H 'Content-Type: application/json' \
+    -d '{"model":"embed","input":"warm-up"}' | grep '"embedding"' >/dev/null; then
   echo "embed: ok"
 else
   echo "embed: FAILED"; fail=1

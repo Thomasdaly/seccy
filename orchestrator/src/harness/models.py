@@ -14,6 +14,7 @@ can report cost per confirmed bug without re-querying Langfuse.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -24,17 +25,23 @@ from .config import Config
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def _cost_of(response: httpx.Response, data: dict) -> float:
-    """LiteLLM's computed USD cost. It rides in the x-litellm-response-cost
-    header for every provider; only some (e.g. OpenRouter) also echo it in
-    usage.cost. Header first, JSON body as fallback."""
-    hdr = response.headers.get("x-litellm-response-cost")
-    if hdr:
+def _cost_of(response: httpx.Response, data: dict) -> float | None:
+    """Return the first usable USD cost, or flag missing spend."""
+    usage = data.get("usage")
+    candidates = (
+        response.headers.get("x-litellm-response-cost"),
+        usage.get("cost") if isinstance(usage, dict) else None,
+    )
+    for value in candidates:
+        if isinstance(value, bool):
+            continue
         try:
-            return float(hdr)
-        except ValueError:
-            pass
-    return float(data.get("usage", {}).get("cost", 0.0) or 0.0)
+            cost = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(cost) and cost >= 0:
+            return cost
+    return None
 
 
 @dataclass
@@ -44,11 +51,16 @@ class Usage:
     by_tier: dict[str, float] = field(default_factory=dict)
     calls_by_tier: dict[str, int] = field(default_factory=dict)
 
-    def add(self, tier: str, cost: float) -> None:
+    unknown_cost_calls: int = 0
+
+    def add(self, tier: str, cost: float | None) -> None:
         self.calls += 1
+        self.calls_by_tier[tier] = self.calls_by_tier.get(tier, 0) + 1
+        if cost is None:
+            self.unknown_cost_calls += 1
+            return
         self.cost_usd += cost
         self.by_tier[tier] = self.by_tier.get(tier, 0.0) + cost
-        self.calls_by_tier[tier] = self.calls_by_tier.get(tier, 0) + 1
 
 
 class Models:
@@ -60,6 +72,7 @@ class Models:
             base_url=cfg.litellm_base_url,
             headers={"Authorization": f"Bearer {cfg.litellm_key}"},
             timeout=120.0,
+            trust_env=False,
         )
 
     def close(self) -> None:
@@ -86,35 +99,36 @@ class Models:
                 "tags": ["harness", f"tier:{model}"],
             },
         }
-        r = self._client.post("/v1/chat/completions", json=body)
-        r.raise_for_status()
-        data = r.json()
-        self.usage.add(model, _cost_of(r, data))
-        return data["choices"][0]["message"].get("content") or ""
+        cost = None
+        try:
+            response = self._client.post("/v1/chat/completions", json=body)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("expected a response object")
+            cost = _cost_of(response, data)
+            content = data["choices"][0]["message"].get("content")
+            return content if isinstance(content, str) else ""
+        finally:
+            self.usage.add(model, cost)
 
     def _chat_json(self, model: str, step: str, messages: list[dict], max_tokens: int = 512) -> dict:
-        """A chat call expected to return JSON. Tolerant of prose wrapping or a
-        reasoning model emitting the object inside other text. On a transport or
-        HTTP error, returns {} so the loop degrades to its deterministic prior
-        rather than aborting the whole run."""
+        """Return a decoded object, leaving unavailable responses empty."""
         try:
             txt = self._chat(model, step, messages, max_tokens=max_tokens)
-        except httpx.HTTPError as e:
-            detail = ""
-            if isinstance(e, httpx.HTTPStatusError):
-                detail = f" {e.response.status_code}: {e.response.text[:200]}"
-            print(f"[models] {model}/{step} call failed ({type(e).__name__}){detail} — falling back")
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError, IndexError):
             return {}
         try:
-            return json.loads(txt)
-        except Exception:
-            m = _JSON_BLOCK.search(txt)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except Exception:
-                    pass
-        return {}
+            data = json.loads(txt)
+        except ValueError:
+            match = _JSON_BLOCK.search(txt)
+            if not match:
+                return {}
+            try:
+                data = json.loads(match.group(0))
+            except ValueError:
+                return {}
+        return data if isinstance(data, dict) else {}
 
     # --- tier helpers ---
     def glue(self, step: str, prompt: str, system: str | None = None, max_tokens: int = 384) -> dict:
@@ -141,12 +155,14 @@ class Models:
             "input": text,
             "metadata": {"session_id": self.run_id, "generation_name": step, "tags": ["harness"]},
         }
+        cost = None
         try:
             r = self._client.post("/v1/embeddings", json=body)
             r.raise_for_status()
             data = r.json()
-            self.usage.add(self.cfg.model_embed, _cost_of(r, data))
+            cost = _cost_of(r, data) if isinstance(data, dict) else None
             return data["data"][0]["embedding"]
-        except Exception as e:
-            print(f"[models] embed/{step} failed ({type(e).__name__}) — dedup treats as unique")
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError, IndexError):
             return []
+        finally:
+            self.usage.add(self.cfg.model_embed, cost)

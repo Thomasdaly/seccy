@@ -1,8 +1,6 @@
 -- Harness findings DB (guide §8 run schema + guardrail events), the
 -- dashboard's read-only role and the orchestrator's writer role. Idempotent;
--- setup-2060.sh applies it with:
---   docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 \
---     -v ro_password="$DASHBOARD_DB_PASSWORD" [-v rw_password="$HARNESS_DB_PASSWORD"] < db/harness.sql
+-- setup-2060.sh provisions the roles and applies this schema.
 -- Lives in the default `postgres` database; Langfuse has its own `langfuse` DB.
 --
 -- Orchestrator contract (what the dashboard reads):
@@ -14,6 +12,41 @@
 set client_min_messages = warning;
 
 create schema if not exists harness;
+
+-- This schema is separate from the findings writer's broad table grants.
+create schema if not exists harness_guardrails;
+
+create table if not exists harness_guardrails.dispatch_policy (
+  singleton        boolean primary key default true check (singleton),
+  stopped          boolean not null default true,
+  min_interval_ms  integer not null default 250 check (min_interval_ms > 0),
+  last_dispatch_at timestamptz not null default '-infinity'
+);
+
+insert into harness_guardrails.dispatch_policy (singleton) values (true)
+on conflict (singleton) do nothing;
+
+-- Claim is an atomic, stop-aware reservation. Completion extends pacing from
+-- the end of the request. Both writes survive runner disconnects.
+create or replace function harness_guardrails.advance_dispatch(claim boolean)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog
+as $advance$
+begin
+  update harness_guardrails.dispatch_policy
+     set last_dispatch_at = greatest(last_dispatch_at, clock_timestamp())
+   where singleton
+     and (not claim or (
+       not stopped and last_dispatch_at + min_interval_ms * interval '1 millisecond' <= clock_timestamp()
+     ));
+  return found;
+end;
+$advance$;
+
+revoke all on schema harness_guardrails from public;
+revoke all on function harness_guardrails.advance_dispatch(boolean) from public;
 
 create table if not exists harness.runs (
   id         text primary key,
@@ -93,6 +126,8 @@ alter role dashboard_ro set default_transaction_read_only = on;
 alter role dashboard_ro set statement_timeout = '5s';
 grant usage on schema harness to dashboard_ro;
 grant select on all tables in schema harness to dashboard_ro;
+grant usage on schema harness_guardrails to dashboard_ro;
+grant select (singleton, stopped) on harness_guardrails.dispatch_policy to dashboard_ro;
 alter default privileges in schema harness grant select on tables to dashboard_ro;
 
 -- Orchestrator role (HARNESS_DATABASE_URL on the M1): writes runs, never deletes,
@@ -105,6 +140,9 @@ alter role harness_rw set statement_timeout = '30s';
 grant usage on schema harness to harness_rw;
 grant select, insert, update on all tables in schema harness to harness_rw;
 grant usage, select on all sequences in schema harness to harness_rw;
+grant usage on schema harness_guardrails to harness_rw;
+grant select (singleton, stopped) on harness_guardrails.dispatch_policy to harness_rw;
+grant execute on function harness_guardrails.advance_dispatch(boolean) to harness_rw;
 alter default privileges in schema harness grant select, insert, update on tables to harness_rw;
 alter default privileges in schema harness grant usage, select on sequences to harness_rw;
 \endif

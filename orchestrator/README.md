@@ -1,66 +1,51 @@
-# orchestrator
+# Orchestrator
 
-The agent loop (guide §6). Runs on the M1; drives the 2060's services (LiteLLM,
-Qdrant, Postgres, Langfuse) over Tailscale and scores itself against the offline
-lab's ground truth.
+The CLI supports the configured VAmPI lab twins. Dry run reads the vendored
+OpenAPI spec and prints the operation inventory.
 
-```bash
-cp ../.env.example ../.env   # set LITELLM_BASE_URL + LITELLM_MASTER_KEY (2060 values)
-uv sync
+    uv run harness --target vampi --dry-run
 
-uv run harness --target vampi            # run against the VAmPI lab, then score
-uv run harness --target vampi --dry-run  # map surface + build probes, no model calls
-```
+Live lab runs write redacted artifacts and record probes as needing manual
+review. The CLI returns 1 when no confirmed findings are available and 130 when
+stopped. It does not send lab data to models or Qdrant.
 
-## What a run does
-
-```
-build identities      target logs in the seeded users (A, B, admin)
-map operations        OpenAPI spec -> operations; path-param ops = object refs
-for each probe:
-    plan   = planner(op, identities)        # tier 1: who may / may not access
-    replay = execute(probe)                 # captured req/resp = evidence
-    obs    = glue(replay)                   # tier 0: normalize, looks_interesting
-    if interesting:
-        verdict = judge(probe, rule, obs)   # tier 2: confirm across the boundary
-        if confirmed and not duplicate(embed(obs)):   # tier 0 embed + Qdrant
-            finding
-enforce throughout: scope allowlist, rate limit, kill switch (guide §7)
-```
-
-Every model call is tagged `metadata={session_id: run_id, generation_name: step}`
-so Langfuse joins spend to the run and the dashboard's Flows/Steps populate. The
-run prints recall, false-positive count and cost per confirmed bug, and writes
-evidence + a report JSON to `../artifacts/<run_id>/`.
-
-## Config (env)
-
-| Var | Default | |
+| Variable | Default | Meaning |
 |---|---|---|
-| `LITELLM_BASE_URL`, `LITELLM_MASTER_KEY` | `http://100.102.105.11:4000` | the router |
-| `HARNESS_SCOPE_ALLOWLIST` | the two VAmPI twins | host:port the harness may touch; everything else is dropped + logged |
-| `HARNESS_RATE_LIMIT_RPS` | `4` | per-run request ceiling |
-| `HARNESS_KILL` / `HARNESS_KILL_SWITCH` | — / `.kill` | env=1 or a file halts the run |
-| `HARNESS_DATABASE_URL` | unset | when set, writes the `harness.*` schema the dashboard reads; the run scores without it |
-| `QDRANT_URL` | unset | persist dedup vectors (else in-memory for the run) |
-| `HARNESS_ARTIFACTS_DIR` | `artifacts` | evidence + report output |
+| HARNESS_SCOPE_ALLOWLIST | VAmPI lab twins | Permitted host:port entries. An explicitly empty value denies all requests. Lab addressing is independent of LiteLLM. |
+| HARNESS_RATE_LIMIT_RPS | 4 | Finite positive local request ceiling. The shared policy can impose a slower rate. |
+| HARNESS_KILL_SWITCH | .kill | Stop file. Relative paths resolve from the repository root. |
+| HARNESS_KILL | unset | Set to 1 in the runner environment to prevent dispatch. Use the file to stop an existing process. |
+| HARNESS_DATABASE_URL | unset | Required for live runs. Use the same direct, session-preserving Postgres database for all runners. |
+| HARNESS_ARTIFACTS_DIR | artifacts | Directory for private, redacted artifacts and the run report. |
 
-## Baseline (VAmPI)
+Apply `db/harness.sql` before live use. It creates a shared policy that starts
+stopped with a 250 ms minimum interval. The database operator controls
+`harness_guardrails.dispatch_policy.stopped` and `min_interval_ms`. The runner
+can read the stop signal and reserve a permit, and its role cannot change the
+operator's settings. Applying the schema again preserves the policy.
 
-First measured run — the "before results" to improve against:
+The gate allows one live run across all runners using the same database. A
+local stop file, a shared stop, or an unavailable policy prevents further
+dispatch at a checked boundary. A request already sent can still complete on
+the server. Dry runs do not require Postgres.
 
-```
-Recall (authz):   4/4 = 100%   (BOLA books, mass-assign admin, BFLA password, excessive _debug)
-False positives:  0            (secure twin diverged on every gated probe)
-Spend:            ~$0.010/run  (judge ~67%, planner ~33%, glue+embed $0 local)
-Cost per bug:     ~$0.0026
-```
+Live response decoding requires macOS and `/usr/bin/sandbox-exec`. The
+orchestrator checks the decoder before sending any requests. It passes only
+the current response body to a short-lived process with an empty environment,
+restricted filesystem reads, and no network access. The process may see
+credentials returned in that response. HTTP dispatch remains in the
+orchestrator process.
 
-## Still stubbed / next
+## Cross-run review archive
 
-- `HARNESS_DATABASE_URL` is unset by default, so runs don't yet populate the
-  dashboard's Flows + lab-eval views. Point it at a Postgres writer role to wire that.
-- Replay runs in-process; production wants the isolated repro sandbox (guide §4.1,
-  principle 4) that never holds the target creds or the LiteLLM keys.
-- Only the VAmPI target is implemented; crAPI is next (its ground truth is in
-  `lab/ground-truth/crapi.yaml`).
+After reviewing a finding, assign opaque UUIDs to the review scope and finding.
+Reuse those IDs when a human identifies the same finding in a different run.
+Use the UUID suffix of the source run ID in `_report.json` as the run ID.
+
+    uv run harness-archive-review --scope-id <uuid> --finding-id <uuid> --run-id <uuid>
+
+Set `QDRANT_URL` to your review archive endpoint. A configured
+`QDRANT_API_KEY` requires HTTPS. The command stores derived identifiers
+and reports whether another run contains the same review. Repeat submissions
+of the same run are idempotent. The archive receives no target data or
+embeddings and is separate from live runs and scoring.

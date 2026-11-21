@@ -1,23 +1,26 @@
-"""Guardrails baked into every run (guide §7). Not optional: in Australia there
-is no good-faith research defence, so the harness must refuse any host it was
-not explicitly authorized to touch, cap its request rate, and stop on a flag.
-
-These enforce *throughout* the loop — every outbound request passes through
-`ScopeAllowlist.check` and `RateLimiter.acquire`, and the loop polls the
-`KillSwitch` between operations. Denials are surfaced to the caller so they land
-in `harness.guardrail_events` and on the dashboard.
-"""
+"""Enforce host scope, dispatch pacing, and the operator stop signal."""
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from pathlib import Path
+from typing import Callable
+
+import httpx
+
+from .config import REPO
+from .shared_dispatch import SharedDispatch
 
 
 class ScopeViolation(Exception):
     """Raised when a request targets a host outside the allowlist."""
+
+
+class KillEngaged(Exception):
+    """Raised when the operator stop signal is active."""
 
 
 @dataclass
@@ -31,61 +34,101 @@ class ScopeAllowlist:
     """An explicit host:port allowlist. Anything else is dropped and logged."""
 
     def __init__(self, entries: list[str]):
-        self.entries = set(entries)
+        self.entries = set()
+        for entry in entries:
+            try:
+                host, port = entry.rsplit(":", 1)
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                url = httpx.URL(f"http://{host}:{port}")
+                if not port.isascii() or not port.isdecimal() or url.raw_path != b"/":
+                    raise ValueError
+                self.entries.add(self.host_port(url))
+            except (ValueError, httpx.InvalidURL, ScopeViolation):
+                raise ValueError("invalid scope entry, expected host:port") from None
 
-    def host_port(self, url: str) -> str:
-        p = urlparse(url)
-        port = p.port or (443 if p.scheme == "https" else 80)
-        return f"{p.hostname}:{port}"
+    def host_port(self, url: str | httpx.URL) -> str:
+        try:
+            parsed = httpx.URL(url)
+        except httpx.InvalidURL:
+            raise ScopeViolation("invalid target URL") from None
+        if parsed.scheme not in {"http", "https"} or not parsed.raw_host or parsed.userinfo:
+            raise ScopeViolation("invalid target authority")
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        if not 1 <= port <= 65535:
+            raise ScopeViolation("invalid target port")
+        host = parsed.raw_host.decode("ascii")
+        if ":" in host:
+            host = f"[{host}]"
+        return f"{host}:{port}"
 
-    def allowed(self, url: str) -> bool:
-        return self.host_port(url) in self.entries
+    def allowed(self, url: str | httpx.URL) -> bool:
+        try:
+            self.check(url)
+        except ScopeViolation:
+            return False
+        return True
 
-    def check(self, url: str) -> None:
-        if not self.allowed(url):
-            raise ScopeViolation(self.host_port(url))
+    def check(self, url: str | httpx.URL) -> str:
+        authority = self.host_port(url)
+        if authority not in self.entries:
+            raise ScopeViolation("target authority is outside scope")
+        return authority
 
 
 class RateLimiter:
-    """Simple thread-safe token bucket: at most `rps` requests per second,
-    matching program rules (breaching a bounty's ceiling gets you banned)."""
+    """Space permits using a monotonic clock, without idle bursts."""
 
     def __init__(self, rps: float):
-        self.rps = max(rps, 0.1)
-        self.min_interval = 1.0 / self.rps
+        if not math.isfinite(rps) or rps <= 0 or not math.isfinite(1.0 / rps):
+            raise ValueError("request rate must be finite and positive")
+        self.rps = rps
+        self.min_interval = 1.0 / rps
         self._lock = threading.Lock()
         self._next = 0.0
         self.throttles = 0
 
-    def acquire(self) -> bool:
-        """Block until the next request is permitted. Returns True if it had to
-        wait (a throttle event worth logging)."""
+    def defer(self) -> None:
+        """Measure the next interval from a completed or failed dispatch."""
         with self._lock:
-            now = time.monotonic()
-            wait = self._next - now
-            if wait > 0:
+            self._next = time.monotonic() + self.min_interval
+
+    def acquire(self, check_stop: Callable[[], None]) -> bool:
+        with self._lock:
+            check_stop()
+            waited = self._next > time.monotonic()
+            if waited:
                 self.throttles += 1
-                time.sleep(wait)
-                self._next += self.min_interval
-                return True
-            self._next = now + self.min_interval
-            return False
+            while (remaining := self._next - time.monotonic()) > 0:
+                time.sleep(min(remaining, 0.1))
+                check_stop()
+            self._next = time.monotonic() + self.min_interval
+            return waited
 
 
 class KillSwitch:
-    """One flag halts all runners. A file on disk (or the HARNESS_KILL env var)
-    so it can be tripped from anywhere — another shell, a cron, a watchdog."""
+    """Local emergency stop via a file or the runner's environment."""
 
     def __init__(self, path: str):
-        self.path = path
+        self.path = Path(path).expanduser().absolute()
 
     def engaged(self) -> bool:
-        return os.path.exists(self.path) or os.environ.get("HARNESS_KILL") == "1"
+        if os.environ.get("HARNESS_KILL") == "1":
+            return True
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
 
     def detail(self) -> str:
         if os.environ.get("HARNESS_KILL") == "1":
             return "engaged (HARNESS_KILL=1)"
-        return f"engaged ({self.path} present)"
+        return "engaged (stop file present or inaccessible)"
 
 
 @dataclass
@@ -93,26 +136,46 @@ class Guardrails:
     scope: ScopeAllowlist
     rate: RateLimiter
     kill: KillSwitch
+    shared: SharedDispatch
     events: list[GuardrailEvent] = field(default_factory=list)
 
     @classmethod
-    def from_config(cls, cfg) -> "Guardrails":
+    def from_config(cls, cfg, shared: SharedDispatch) -> "Guardrails":
         return cls(
             scope=ScopeAllowlist(cfg.scope_allowlist),
             rate=RateLimiter(cfg.rate_limit_rps),
-            kill=KillSwitch(cfg.kill_switch_file),
+            kill=KillSwitch(str(REPO / Path(cfg.kill_switch_file).expanduser())),
+            shared=shared,
         )
 
     def record(self, kind: str, host: str | None, detail: str | None = None) -> None:
         self.events.append(GuardrailEvent(kind, host, detail))
 
-    def guard_request(self, url: str) -> None:
-        """Enforce scope + rate before an outbound request. Raises ScopeViolation
-        (also logged) if the host is out of scope."""
+    def check_stop(self) -> None:
+        if self.kill.engaged():
+            detail = self.kill.detail()
+        elif self.shared.stopped():
+            detail = "engaged (shared dispatch policy)"
+        else:
+            return
+        self.record("kill_switch", None, detail)
+        raise KillEngaged(detail)
+
+    def check_scope(self, url: httpx.URL) -> str:
         try:
-            self.scope.check(url)
-        except ScopeViolation as v:
-            self.record("scope_denied", str(v), f"blocked {url}")
+            return self.scope.check(url)
+        except ScopeViolation:
+            self.record("scope_denied", None, "target authority denied")
             raise
-        if self.rate.acquire():
-            self.record("rate_limited", self.scope.host_port(url))
+
+    def guard_request(self, url: httpx.URL) -> None:
+        self.check_stop()
+        authority = self.check_scope(url)
+        waited = self.rate.acquire(self.check_stop)
+        while not self.shared.reserve():
+            waited = True
+            self.check_stop()
+            time.sleep(0.1)
+        if waited:
+            self.record("rate_limited", authority)
+        self.check_stop()

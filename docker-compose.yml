@@ -153,7 +153,8 @@ services:
     # Langfuse project keys for reads, its own read-only DB role.
     environment:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD in .env}
-      DASHBOARD_DATABASE_URL: postgresql://dashboard_ro:${DASHBOARD_DB_PASSWORD:?set DASHBOARD_DB_PASSWORD in .env}@postgres:5432/postgres
+      DASHBOARD_DB_HOST: postgres
+      DASHBOARD_DB_PASSWORD: ${DASHBOARD_DB_PASSWORD:?set DASHBOARD_DB_PASSWORD in .env}
       LITELLM_URL: http://litellm:4000
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       LANGFUSE_HOST: http://langfuse:3000

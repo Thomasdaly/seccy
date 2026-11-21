@@ -14,7 +14,7 @@ from pathlib import Path
 
 import yaml
 
-_METHODS = ("get", "post", "put", "delete", "patch")
+_METHODS = ("get", "post", "put", "delete", "patch", "head", "options", "trace")
 
 
 @dataclass
@@ -45,7 +45,7 @@ def load_spec(path: str | Path) -> dict:
 
 def map_operations(spec: dict) -> list[Operation]:
     ops: list[Operation] = []
-    global_security = bool(spec.get("security"))
+    global_security = spec.get("security") or []
     for path, item in (spec.get("paths") or {}).items():
         if not isinstance(item, dict):
             continue
@@ -59,7 +59,8 @@ def map_operations(spec: dict) -> list[Operation]:
                 for prm in params
                 if isinstance(prm, dict) and prm.get("in") == "path" and prm.get("name")
             ]
-            secured = global_security or ("security" in op)
+            security = op.get("security", global_security)
+            secured = bool(security) and all(security)
             ops.append(
                 Operation(
                     method=method.lower(),
