@@ -56,8 +56,9 @@ and a `scope`:
 
 A run is scored by:
 - **Recall** = confirmed `authz` findings ÷ `authz` findings in the file.
-- **False positives** = anything flagged on VAmPI's **secure** twin (`:5062`), or
-  on an endpoint in a file's `negatives:` list.
+- **False positives** include hits on a flag-gated finding on VAmPI's secure
+  twin (`:5062`) and hits on endpoints in a file's `negatives:` list. Findings
+  marked `gated: false` can be present on both twins.
 - **Cost per confirmed bug** = Langfuse run spend ÷ confirmed findings (guide §8,
   the number to drive down).
 
