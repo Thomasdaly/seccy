@@ -98,14 +98,12 @@ class FindingsDB:
             (probe_id, status_code, request_ref, response_ref),
         )
 
-    def add_verdict(self, probe_id: int | None, label: str, severity: str | None,
-                    is_duplicate: bool, evidence_ref: str | None, trace_id: str | None = None) -> None:
+    def queue_review(self, probe_id: int | None, evidence_ref: str) -> None:
         if probe_id is None:
             return
         self._exec(
-            "insert into harness.verdicts (probe_id, label, severity, is_duplicate, evidence_ref, trace_id) "
-            "values (%s,%s,%s,%s,%s,%s)",
-            (probe_id, label, severity, is_duplicate, evidence_ref, trace_id),
+            "insert into harness.verdicts (probe_id, evidence_ref) values (%s,%s)",
+            (probe_id, evidence_ref),
         )
 
     def add_guardrail_event(self, run_id: str, kind: str, host: str | None, detail: str | None) -> None:

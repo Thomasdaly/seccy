@@ -15,7 +15,10 @@ SCRIPT = REPO / "scripts" / "remote.sh"
 FAKE_DOCKER = """#!/bin/sh
 printf '%s\\n' "$*" >> "$DOCKER_LOG"
 case "$*" in
-  *"select case"*) [ -z "$POLICY_STATE" ] || printf '%s\\n' "$POLICY_STATE" ;;
+  *"set stopped = true"*) exit "${STOP_EXIT_CODE:-0}" ;;
+  *"select case"*)
+    [ "${STATUS_EXIT_CODE:-0}" = 0 ] || exit "$STATUS_EXIT_CODE"
+    [ -z "$POLICY_STATE" ] || printf '%s\\n' "$POLICY_STATE" ;;
 esac
 """
 FAKE_SSH = """#!/bin/sh
@@ -62,6 +65,29 @@ class RemoteDispatchTests(TestCase):
         self.assertIn("update harness_guardrails.dispatch_policy set stopped = true where singleton", update)
         self.assertIn("select case", show)
 
+    def test_stop_fails_if_verification_reports_dispatch_is_still_allowed(self):
+        result = self._dispatch("stop", POLICY_STATE="dispatch allowed min_interval_ms=250")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dispatch allowed", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_stop_propagates_failure_from_update_or_verification(self):
+        for variable, code in (("STOP_EXIT_CODE", 125), ("STATUS_EXIT_CODE", 2)):
+            with self.subTest(variable=variable):
+                result = self._dispatch("stop", **{variable: str(code)})
+                self.assertEqual(result.returncode, code)
+                self.assertEqual(result.stdout, "")
+
+    def test_stop_rejects_malformed_readback_without_echoing_it(self):
+        for state in ("stopped min_interval_ms=", "stopped min_interval_ms=0",
+                      "stopped min_interval_ms=250\nsynthetic-diagnostic"):
+            with self.subTest(state=state):
+                result = self._dispatch("stop", POLICY_STATE=state)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("dispatch stop verification failed", result.stderr)
+                self.assertNotIn("synthetic-diagnostic", result.stderr)
+
     def test_start_refuses_without_a_terminal(self):
         for stdin in (subprocess.DEVNULL, None):
             with self.subTest(stdin=stdin):
@@ -74,9 +100,11 @@ class RemoteDispatchTests(TestCase):
                 self.assertEqual(self._calls(), [])
 
     def test_missing_policy_row_is_an_error(self):
-        result = self._dispatch("status", POLICY_STATE="")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("dispatch policy row missing", result.stderr)
+        for action in ("status", "stop"):
+            with self.subTest(action=action):
+                result = self._dispatch(action, POLICY_STATE="")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("dispatch policy row missing", result.stderr)
 
     def test_unknown_subcommand_is_rejected(self):
         result = self._dispatch("flip")

@@ -27,7 +27,7 @@ Each view answers one question, and each metric ties back to a principle in
 | **Health** | Is the stack up right now? | 30 s probes of LiteLLM, Ollama, Qdrant, Langfuse, Postgres and Langfuse v4's worker, ClickHouse, Redis and MinIO, with 24 h uptime strips. Ollama residency per route: CPU-by-design embeddings are fine, partial offload of qwen3:8b on 6 GB is expected, 0% VRAM on a GPU model means CUDA fallback. Disk, route config. |
 | **Trends** | Is it getting cheaper and better? | Spend, calls, tokens, errors and p95 latency per route tier. Exact figures, computed in ClickHouse via Langfuse `v2/metrics`. Unique findings over time and **cost per finding**, the number to drive down (principle 5). |
 | **Flows** | Where do the work and money go? | Calls → tokens → spend split per tier (principle 2: glue does the volume, the judge is rare but owns the spend). Agent funnel: operations → probes → executed → interesting → judged → confirmed → evidenced → unique, with the **evidence gate** called out (principle 3). Per-step and per-run spend. Scope, rate-limit and kill-switch events (guide §7). |
-| **Findings** | What did the harness find? | Every confirmed and needs-review verdict joined to its endpoint, probe identity, latest exchange, evidence ref and judge trace. Filter chips (findings, needs review, no evidence, duplicates, lab false positives, not in ground truth), text filter, CSV export (formula-safe), severity and most-hit endpoints. On lab targets each verdict carries its ground-truth match. |
+| **Findings** | What did the harness find? | Confirmed verdicts, severity and most-hit endpoints for the selected range. The **Needs review** filter shows the oldest pending verdicts across all dates, up to 5,000, with the endpoint, run and evidence availability. |
 | **Eval** | Is the harness actually right? | Lab runs scored on `lab/ground-truth/*.yaml` (lab/README.md): **recall** on authz bugs, **false positives** on `negatives` and VAmPI's secure twin, **cost per confirmed bug**. Recall per run, a coverage matrix (ground-truth entry × last runs) and a scored-runs table. |
 | **Raw** | What's behind the numbers? | Langfuse generations and root traces (cursor-paged `v2/observations`), every harness table, Qdrant points, and a read-only SQL console. |
 
@@ -71,6 +71,30 @@ The dashboard only reads. Three things make the Flows view work:
    `scope: other` entry on the same endpoint, since a confirmed verdict claims an authz bug.
    Entries without a fixed endpoint (`* (Authorization: Bearer)`) are listed as
    manual and left out of the recall denominator.
+
+## Human review
+
+Open **Findings → Needs review**, select a verdict, and note its ID and run.
+Open the redacted evidence reference on the runner to inspect the exchange.
+The dashboard has read-only access and uses a shared viewer password.
+Browser decisions would require individual authentication and a write API
+that can attribute each decision to the signed-in reviewer.
+
+An operator can grant the `harness_reviewer` group to an existing individual
+PostgreSQL login. Use that login to record one decision per pending verdict.
+In `psql`, set `verdict_id` to the ID from the drawer, then run one of:
+
+```sql
+SELECT harness.review_verdict(:'verdict_id'::bigint, 'confirmed', 'medium');
+SELECT harness.review_verdict(:'verdict_id'::bigint, 'rejected');
+```
+
+Confirmation requires a nonblank evidence reference and a severity from
+`critical`, `high`, `medium`, `low` or `info`. Rejection takes no severity.
+The function returns `true` if it recorded the decision and `false` if the
+verdict is missing, already closed, or missing required evidence. The
+dashboard shows the reviewer login and decision time on reviewed verdicts.
+Existing decisions retain their labels and any existing evidence.
 
 ## Security
 

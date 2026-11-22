@@ -306,12 +306,16 @@ class DemoBackend(Backend):
             "runs": runs,
         }
 
-    async def verdict_rows(self, since: float | None = None, run_id: str | None = None) -> list[dict]:
+    async def verdict_rows(self, since: float | None = None, run_id: str | None = None,
+                           *, pending_only: bool = False) -> list[dict]:
         out = []
-        for v in sorted(self.verdicts, key=lambda v: -v["judged_at"]):
+        for v in sorted(self.verdicts, key=lambda v: (v["judged_at"], v["id"]), reverse=not pending_only):
             p = self.probe_by_id[v["probe_id"]]
             o = self.op_by_id[p["op_id"]]
-            if run_id is not None:
+            if pending_only:
+                if v["label"] != "needs_review":
+                    continue
+            elif run_id is not None:
                 if o["run_id"] != run_id:
                     continue
             elif v["judged_at"] < (since or 0) or v["label"] not in ("confirmed", "needs_review"):
@@ -319,6 +323,7 @@ class DemoBackend(Backend):
             r = self.run_by_id.get(o["run_id"]) or {}
             e = self.exchange_of.get(p["id"]) or {}
             out.append({"id": v["id"], "judged_at": v["judged_at"], "label": v["label"], "severity": v["severity"],
+                        "reviewed_by": v.get("reviewed_by"),
                         "is_duplicate": v["is_duplicate"], "evidence_ref": v["evidence_ref"], "trace_id": v["trace_id"],
                         "run_id": o["run_id"], "target": r.get("target"), "run_status": r.get("status"),
                         "method": o["method"], "path": o["path"], "probe_id": p["id"], "identity": p["identity"],

@@ -15,7 +15,7 @@ import httpx
 
 from .config import Config
 from .executor import Executor
-from .guardrails import Guardrails, KillEngaged
+from .guardrails import Guardrails, KillEngaged, KillSwitch
 from .models import Usage
 from .scoring import Outcome, Report, load_ground_truth, score
 from .shared_dispatch import SharedDispatch
@@ -24,6 +24,10 @@ from .surface import load_spec, map_operations
 
 
 def run(cfg: Config, target, spec_path: str, gt_path: str, program: str) -> Report:
+    kill = KillSwitch(cfg.kill_switch_file)
+    if kill.engaged():
+        raise KillEngaged(kill.detail())
+
     ground_truth = load_ground_truth(gt_path)
     operations = map_operations(load_spec(spec_path))
 
@@ -90,7 +94,7 @@ def _run(cfg, target, program, guardrails, ground_truth, operations) -> Report:
                                                 signal if result else None)
                         if result:
                             db.add_exchange(probe_id, result.attacker.status_code, evidence_ref, evidence_ref)
-                        db.add_verdict(probe_id, "needs_review", None, False, evidence_ref)
+                        db.queue_review(probe_id, evidence_ref)
                     print(f"  [{probe.id}] needs review")
 
                 guardrails.check_stop()

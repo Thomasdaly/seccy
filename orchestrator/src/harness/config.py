@@ -39,6 +39,18 @@ def resolve_kill_switch_path(raw: str | os.PathLike[str]) -> Path:
     return path if path.is_absolute() else REPO / path
 
 
+def configured_rate_limit_rps() -> float:
+    return float(os.environ.get("HARNESS_RATE_LIMIT_RPS") or "4")
+
+
+def configured_kill_switch_file() -> str:
+    return str(resolve_kill_switch_path(os.environ.get("HARNESS_KILL_SWITCH") or ".kill"))
+
+
+def configured_artifacts_dir() -> str:
+    return os.environ.get("HARNESS_ARTIFACTS_DIR") or "artifacts"
+
+
 @dataclass(frozen=True)
 class Config:
     # --- model router (LiteLLM, OpenAI-compatible) ---
@@ -55,15 +67,13 @@ class Config:
     scope_allowlist: list[str] = field(
         default_factory=lambda: _split("HARNESS_SCOPE_ALLOWLIST", f"{LAB_HOST}:5061,{LAB_HOST}:5062")
     )
-    rate_limit_rps: float = field(default_factory=lambda: float(_env("HARNESS_RATE_LIMIT_RPS", "4") or "4"))
-    kill_switch_file: str = field(
-        default_factory=lambda: str(resolve_kill_switch_path(_env("HARNESS_KILL_SWITCH", ".kill") or ".kill"))
-    )
+    rate_limit_rps: float = field(default_factory=configured_rate_limit_rps)
+    kill_switch_file: str = field(default_factory=configured_kill_switch_file)
 
     # --- shared live dispatch policy and persistence ---
     database_url: str | None = field(default_factory=lambda: _env("HARNESS_DATABASE_URL"))
     qdrant_url: str | None = field(default_factory=lambda: _env("QDRANT_URL"))
-    artifacts_dir: str = field(default_factory=lambda: _env("HARNESS_ARTIFACTS_DIR", "artifacts") or "artifacts")
+    artifacts_dir: str = field(default_factory=configured_artifacts_dir)
 
     # --- dedup ---
     dedup_threshold: float = field(default_factory=lambda: float(_env("HARNESS_DEDUP_THRESHOLD", "0.95") or "0.95"))

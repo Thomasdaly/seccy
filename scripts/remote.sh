@@ -46,8 +46,19 @@ POLICY_SHOW="select case when stopped then 'stopped' else 'dispatch allowed' end
 policy_sql() { dc exec -T postgres psql -U postgres -qtAX -v ON_ERROR_STOP=1 -c "$1" </dev/null; }
 policy_show() {
   local state
+  local pattern='^(stopped|dispatch allowed) min_interval_ms=[1-9][0-9]*$'
   state=$(policy_sql "$POLICY_SHOW")
   [ -n "$state" ] || { echo "dispatch policy row missing: apply db/harness.sql (runners refuse to dispatch)" >&2; return 1; }
+  if [ "${1:-}" = "stopped" ]; then
+    if ! [[ "$state" =~ $pattern ]]; then
+      echo "dispatch stop verification failed: unexpected policy state" >&2
+      return 1
+    fi
+    if [ "${BASH_REMATCH[1]}" != "stopped" ]; then
+      echo "dispatch stop verification failed: dispatch allowed" >&2
+      return 1
+    fi
+  fi
   echo "$state"
 }
 
@@ -110,11 +121,10 @@ case "$cmd" in
         ;;
       stop)
         policy_sql "update $POLICY set stopped = true where singleton"
-        policy_show
+        policy_show stopped
         ;;
       start)
-        # Deliberately not scriptable: allowing live traffic is a human decision
-        # made for an attended run. Stop it again afterwards.
+        # The terminal prompt protects against accidental activation.
         if [ ! -t 0 ] || [ ! -t 1 ]; then
           echo "dispatch start needs an interactive terminal: a person must confirm live dispatch" >&2
           exit 2

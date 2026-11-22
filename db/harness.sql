@@ -9,6 +9,7 @@
 --   verdicts.evidence_ref must point at a replayable request/response pair;
 --   confirmed + evidence + not duplicate = a finding.
 
+begin;
 set client_min_messages = warning;
 
 create schema if not exists harness;
@@ -98,6 +99,10 @@ create table if not exists harness.verdicts (
   judged_at    timestamptz not null default now()
 );
 
+alter table harness.verdicts
+  alter column label set default 'needs_review',
+  add column if not exists reviewed_by name;
+
 create table if not exists harness.guardrail_events (
   id     bigserial primary key,
   ts     timestamptz not null default now(),
@@ -115,6 +120,7 @@ create index if not exists probes_created_idx    on harness.probes (created_at);
 create index if not exists exchanges_probe_idx   on harness.exchanges (probe_id);
 create index if not exists verdicts_probe_idx    on harness.verdicts (probe_id);
 create index if not exists verdicts_judged_idx   on harness.verdicts (judged_at);
+create index if not exists verdicts_pending_idx   on harness.verdicts (judged_at, id) where label = 'needs_review';
 create index if not exists guardrail_ts_idx      on harness.guardrail_events (ts);
 
 -- Dashboard role: SELECT on harness only, read-only sessions, 5 s statements.
@@ -130,19 +136,69 @@ grant usage on schema harness_guardrails to dashboard_ro;
 grant select (singleton, stopped) on harness_guardrails.dispatch_policy to dashboard_ro;
 alter default privileges in schema harness grant select on tables to dashboard_ro;
 
--- Orchestrator role (HARNESS_DATABASE_URL on the M1): writes runs, never deletes,
--- no DDL, nothing outside schema harness. Only created when rw_password is passed.
+-- Provision new logins when a password is supplied, then update privileges for
+-- existing writers on every schema application.
 \if :{?rw_password}
 select 'create role harness_rw login' where not exists (select from pg_roles where rolname = 'harness_rw')
 \gexec
 alter role harness_rw password :'rw_password';
 alter role harness_rw set statement_timeout = '30s';
+\endif
+
+select exists (select from pg_roles where rolname = 'harness_rw') as have_writer
+\gset
+\if :have_writer
 grant usage on schema harness to harness_rw;
-grant select, insert, update on all tables in schema harness to harness_rw;
+revoke insert, update on all tables in schema harness from harness_rw;
+alter default privileges in schema harness revoke insert, update on tables from harness_rw;
+grant select on all tables in schema harness to harness_rw;
+grant insert on harness.runs, harness.operations, harness.probes, harness.exchanges, harness.guardrail_events to harness_rw;
+grant update (status, ended_at) on harness.runs to harness_rw;
+grant insert (probe_id, evidence_ref) on harness.verdicts to harness_rw;
 grant usage, select on all sequences in schema harness to harness_rw;
 grant usage on schema harness_guardrails to harness_rw;
 grant select (singleton, stopped) on harness_guardrails.dispatch_policy to harness_rw;
 grant execute on function harness_guardrails.advance_dispatch(boolean) to harness_rw;
-alter default privileges in schema harness grant select, insert, update on tables to harness_rw;
+alter default privileges in schema harness grant select on tables to harness_rw;
 alter default privileges in schema harness grant usage, select on sequences to harness_rw;
 \endif
+
+-- Grant this group to individual reviewer logins. The dashboard stays read-only.
+select 'create role harness_reviewer nologin' where not exists (select from pg_roles where rolname = 'harness_reviewer')
+\gexec
+grant usage on schema harness to harness_reviewer;
+grant select on harness.verdicts to harness_reviewer;
+
+create or replace function harness.review_verdict(verdict_id bigint, decision text, decision_severity text default null)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog, pg_temp
+as $review$
+begin
+  if decision is null or decision not in ('confirmed', 'rejected') then
+    raise exception using errcode = '22023', message = 'review decision must be confirmed or rejected';
+  end if;
+  if decision = 'confirmed' and (decision_severity is null
+      or decision_severity not in ('critical', 'high', 'medium', 'low', 'info')) then
+    raise exception using errcode = '22023', message = 'confirmation requires a valid severity';
+  end if;
+  if decision = 'rejected' and decision_severity is not null then
+    raise exception using errcode = '22023', message = 'rejection takes no severity';
+  end if;
+
+  update harness.verdicts
+     set label = decision, severity = decision_severity, reviewed_by = session_user,
+         judged_at = clock_timestamp()
+   where id = verdict_id and label = 'needs_review'
+     and (decision = 'rejected' or evidence_ref ~ '[^[:space:]]');
+  return found;
+end;
+$review$;
+
+revoke all on function harness.review_verdict(bigint, text, text) from public, dashboard_ro;
+\if :have_writer
+revoke all on function harness.review_verdict(bigint, text, text) from harness_rw;
+\endif
+grant execute on function harness.review_verdict(bigint, text, text) to harness_reviewer;
+commit;

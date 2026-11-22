@@ -44,6 +44,6 @@ class SharedDispatch:
             row = self._connection.execute(statement).fetchone()
         except psycopg.Error:
             raise RuntimeError("shared dispatch control unavailable") from None
-        if row is None or type(row[0]) is not bool:
+        if not isinstance(row, tuple) or len(row) != 1 or type(row[0]) is not bool:
             raise RuntimeError("shared dispatch policy unavailable")
         return row[0]

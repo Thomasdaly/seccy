@@ -576,6 +576,7 @@ const labelBadge = (r) => {
 };
 const sevCell = (r) => (r.severity ? h("span", { class: "cell-key" }, h("span", { class: "key-dot", style: { background: SEV_COLOR[r.severity.toLowerCase()] || "var(--s-other)" } }), r.severity) : h("span", { class: "muted" }, "—"));
 const linkTo = (url, text) => (url ? h("a", { href: url, target: "_blank", rel: "noopener noreferrer", onclick: (e) => e.stopPropagation() }, text) : null);
+const hasEvidenceRef = (r) => Boolean(r.evidence_ref?.trim());
 
 function drawerSection(title, ...kids) {
   return h("section", { class: "d-sec" }, h("h3", {}, title), ...kids);
@@ -586,14 +587,22 @@ function openFinding(r) {
   if (state.run) { state.run = null; writeHash({ replace: true }); }
   const body = h("div", {},
     h("div", { class: "d-badges" }, labelBadge(r), r.lab ? gtCell(r) : null),
+    r.label === "needs_review" ? drawerSection("Human review",
+      h("p", { class: "small ink2" }, hasEvidenceRef(r)
+        ? "Inspect the redacted evidence on the runner, then record a decision with your individual PostgreSQL reviewer login."
+        : "Confirmation requires an evidence reference. A reviewer can still reject this verdict."),
+      kv([["Verdict ID", r.id]])) : null,
     drawerSection("Where", kv([["Endpoint", `${r.method} ${r.path}`], ["Target", r.target], ["Run", r.run_id], ["Run status", r.run_status]]),
       r.run_id ? h("button", { class: "btn", onclick: () => openRun(r.run_id) }, "Open run") : null),
     drawerSection("Probe", kv([["Identity", r.identity], ["Tenant", r.tenant], ["Role", r.role], ["Intent", r.intent], ["Probe id", r.probe_id]])),
-    drawerSection("Verdict", kv([["Label", r.label], ["Severity", r.severity], ["Judged", fmtWhen(r.judged_at)], ["Duplicate", r.is_duplicate ? "yes (Qdrant similarity hit)" : "no"], ["Verdict id", r.id]]),
+    drawerSection("Verdict", kv([["Label", r.label], ["Severity", r.severity],
+      [r.label === "needs_review" ? "Queued" : "Decided", fmtWhen(r.judged_at)],
+      ...(r.reviewed_by ? [["Reviewer", r.reviewed_by]] : []),
+      ["Duplicate", r.is_duplicate ? "yes (Qdrant similarity hit)" : "no"], ["Verdict id", r.id]]),
       linkTo(r.trace_link, "Judge trace in Langfuse ↗")),
-    drawerSection("Evidence", r.evidence_ref
-      ? kv([["Replayable pair", r.evidence_ref], ["Last status", r.status_code], ["Request", r.request_blob], ["Response", r.response_blob]])
-      : h("div", { class: "notice" }, statusIcon("critical"), h("span", {}, "No evidence_ref. No evidence, no report: this can't become a finding until the exchange is replayed and stored."))),
+    drawerSection("Evidence", hasEvidenceRef(r)
+      ? kv([["Evidence reference", r.evidence_ref], ["Last status", r.status_code], ["Request", r.request_blob], ["Response", r.response_blob]])
+      : h("div", { class: "notice" }, statusIcon("critical"), h("span", {}, "No evidence reference available."))),
     r.outcome ? drawerSection("Ground truth", h("p", { class: "small ink2" }, OUTCOME[r.outcome][2]), kv([["Lab", `${r.lab} (${r.twin} twin)`], ["Entry", r.gt_id], ["Category", r.gt_category]])) : null);
   openDrawer(`Verdict ${r.id} · ${r.method} ${r.path}`, body);
 }
@@ -697,7 +706,7 @@ function renderFindings(d) {
   const t = d.totals;
   const tiles = h("div", { class: "tiles" },
     tile("Findings", fmtInt(t.findings), `confirmed, evidenced, unique · ${RANGE_LABEL[d.range]}`, true),
-    tile("Needs review", fmtInt(t.needs_review), "judge unsure: human call"),
+    tile("Needs review", fmtInt(t.needs_review) + (t.needs_review === 5000 ? "+" : ""), "Across all dates"),
     tile("No evidence", fmtInt(t.no_evidence), t.no_evidence ? "blocked by the evidence gate" : "evidence gate clean"),
     tile("Duplicates", fmtInt(t.duplicates), "folded by Qdrant dedup"),
     tile("Lab false positives", fmtInt(t.lab_fp), "against ground truth"),
@@ -716,23 +725,33 @@ function renderFindings(d) {
 
   state.ffilter = state.ffilter || "findings";
   const holder = h("div", {});
-  const search = h("input", { type: "search", class: "search", placeholder: "Filter by path, target, run, identity…", "aria-label": "Filter verdicts", value: state.fq || "" });
+  const search = h("input", { type: "search", class: "search", placeholder: "Filter by verdict ID, endpoint, or run…", "aria-label": "Filter verdicts", value: state.fq || "" });
   const chips = h("div", { class: "chips", role: "group", "aria-label": "Verdict filters" });
   const resultCount = h("p", { class: "result-count small muted", role: "status" });
+  const listTitle = h("h2", {}, "Verdicts");
+  const listDescription = h("p", { class: "sub" });
   const visible = () => {
     const pred = (FILTERS.find((f) => f[0] === state.ffilter) || FILTERS[0])[2];
     const q = (state.fq || "").toLowerCase().trim();
-    return d.rows.filter(pred).filter((r) => !q || [r.method, r.path, r.target, r.run_id, r.identity, r.tenant, r.role, r.intent, r.gt_id, r.severity].some((v) => v && String(v).toLowerCase().includes(q)));
+    const source = state.ffilter === "review" ? d.pending_rows : d.rows;
+    return source.filter(pred).filter((r) => !q || [r.id, r.method, r.path, r.target, r.run_id, r.identity, r.tenant, r.role, r.intent, r.gt_id, r.severity].some((v) => v && String(v).toLowerCase().includes(q)));
   };
   const draw = () => {
+    const review = state.ffilter === "review";
     for (const chip of chips.children) chip.setAttribute("aria-pressed", String(chip.dataset.filter === state.ffilter));
     const rows = visible();
+    listTitle.textContent = review ? "Review queue" : "Verdicts";
+    listDescription.textContent = review
+      ? "Oldest pending first, across all dates. Open a verdict to check its evidence and run."
+      : "Newest first. Open a row for evidence and run details.";
     resultCount.textContent = `${fmtInt(rows.length)} matching verdict${rows.length === 1 ? "" : "s"}`;
     exportBtn.disabled = !rows.length;
     holder.replaceChildren(table([
-      { label: "Judged", key: "judged_at", fmt: fmtWhen, cls: "nw" },
+      { label: review ? "Queued" : "Date", key: "judged_at", fmt: fmtWhen, cls: "nw" },
       { label: "Status", render: labelBadge },
-      { label: "Sev", render: sevCell },
+      review
+        ? { label: "Evidence", render: (r) => hasEvidenceRef(r) ? "Reference present" : badge("warning", "Missing") }
+        : { label: "Sev", render: sevCell },
       { label: "Endpoint", render: endpoint },
       { label: "Target", render: (r) => h("span", { class: "mono" }, r.target || "—") },
       { label: "As", render: (r) => [r.identity, r.role, r.tenant].filter(Boolean).join(" · ") || "—", cls: "nw" },
@@ -741,14 +760,19 @@ function renderFindings(d) {
       { label: "", cls: "nw", render: (r) => linkTo(r.trace_link, "Trace ↗") || "—" },
     ], rows, { onRow: openFinding, empty: "No verdicts match.", cap: 50 }));
   };
-  chips.append(...FILTERS.map(([k, label, pred]) => h("button", { class: "chip", "data-filter": k, onclick: () => { state.ffilter = k; draw(); } }, `${label} · ${fmtInt(d.rows.filter(pred).length)}`)));
+  chips.append(...FILTERS.map(([k, label, pred]) => {
+    const count = k === "review" ? t.needs_review : d.rows.filter(pred).length;
+    const capped = k === "review" && count === 5000;
+    return h("button", { class: "chip", "data-filter": k, onclick: () => { state.ffilter = k; draw(); } },
+      `${label} · ${fmtInt(count)}${capped ? "+" : ""}`);
+  }));
   search.addEventListener("input", () => { state.fq = search.value; draw(); });
   const exportBtn = h("button", { class: "btn", onclick: () => download(`harness-verdicts-${d.range}.csv`,
     csv(visible().map((r) => ({ ...r, judged_at: r.judged_at ? new Date(r.judged_at * 1000).toISOString() : "" })), CSV_COLS), "text/csv") }, "Export CSV");
   draw();
 
   const list = h("div", { class: "card" },
-    h("div", { class: "card-head" }, h("div", {}, h("h2", {}, "Verdicts"), h("p", { class: "sub" }, "Newest first. Open a row for evidence and run details.")), h("div", { class: "actions" }, exportBtn)),
+    h("div", { class: "card-head" }, h("div", {}, listTitle, listDescription), h("div", { class: "actions" }, exportBtn)),
     h("div", { class: "toolbar" }, search), chips, resultCount, holder);
   return [tiles, h("div", { class: "stack" }, h("div", { class: "grid g2" }, sevCard, epCard), list)];
 }

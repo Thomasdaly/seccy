@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,8 +14,8 @@ import httpx
 
 from harness.config import REPO
 from harness.executor import Exchange
-from harness.guardrails import Guardrails, KillSwitch, RateLimiter, ScopeAllowlist
-from harness.loop import _run
+from harness.guardrails import Guardrails, KillEngaged, KillSwitch, RateLimiter, ScopeAllowlist
+from harness.loop import _run, run
 from harness.scoring import load_ground_truth
 from harness.targets import Identity, Probe, ProbeResult
 
@@ -37,7 +38,8 @@ def _result(fid: str, signal, control_signal=None) -> ProbeResult:
         control = Exchange(method=method, url="http://example.invalid:8080" + path, status_code=404,
                            response_body={"message": "canary-not-found"})
     return ProbeResult(attacker=attacker, observation="canary observation", signal=signal,
-                       control=control, control_signal=control_signal)
+                       control=control, details={"object": "canary detail"},
+                       control_signal=control_signal)
 
 
 class FakeTarget:
@@ -54,6 +56,25 @@ class FakeTarget:
         return [Probe(id=f"p-{fid}", finding_id=fid, category="synthetic", operation=OPERATIONS[fid][0],
                       description="synthetic", attacker="name1", owner=None, run=run)
                 for fid, run in self.behaviours]
+
+
+class StartupStopTests(TestCase):
+    def test_existing_local_stop_prevents_database_connection(self):
+        spec_path = str(REPO / "lab" / "specs" / "vampi-openapi3.yml")
+        gt_path = str(REPO / "lab" / "ground-truth" / "vampi.yaml")
+        with TemporaryDirectory() as directory:
+            stop_file = Path(directory) / "runner.kill"
+            cfg = SimpleNamespace(kill_switch_file=str(stop_file), scope_allowlist=["example.invalid:80"],
+                                  rate_limit_rps=4, database_url="synthetic")
+            for env_flag, message in (("1", "HARNESS_KILL"), ("0", "stop file")):
+                with (self.subTest(env_flag=env_flag),
+                      patch.dict(os.environ, {"HARNESS_KILL": env_flag}),
+                      patch("harness.loop.SharedDispatch.connect") as connect):
+                    if env_flag == "0":
+                        stop_file.touch()
+                    with self.assertRaisesRegex(KillEngaged, message):
+                        run(cfg, FakeTarget([]), spec_path, gt_path, "synthetic")
+                    connect.assert_not_called()
 
 
 class RunReportTests(TestCase):
@@ -120,9 +141,12 @@ class RunReportTests(TestCase):
         for name, payload in files.items():
             with self.subTest(file=name):
                 self.assertNotIn("canary", json.dumps(payload))
+        for marker in ("canary observation", "canary detail"):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, out)
+                self.assertNotIn(marker, repr(self.db.mock_calls))
 
-        labels = {call.args[1] for call in self.db.add_verdict.call_args_list}
-        self.assertEqual(labels, {"needs_review"})
+        self.assertEqual(self.db.queue_review.call_count, 4)
         self.assertEqual([call.args[3] for call in self.db.add_probe.call_args_list], [True, True, None, True])
         self.db.finish_run.assert_called_once()
         self.assertEqual(self.db.finish_run.call_args.args[1], "done")

@@ -1,0 +1,48 @@
+name: Offline safety
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  safety:
+    name: macOS isolation and review permissions
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: orchestrator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.8"
+          enable-cache: false
+
+      - name: Install locked Python dependencies
+        run: uv sync --locked --python 3.13
+
+      - name: Install PostgreSQL 17 for the disposable cluster
+        run: brew install postgresql@17
+
+      - name: Run offline orchestrator tests
+        run: .venv/bin/python -m unittest discover -s tests
+
+      - name: Exercise the standalone safety module with synthetic settings
+        run: .venv/bin/python -m unittest discover -s tests -p test_safety_check.py -k test_module_entry_point_reports_success_and_failure
+
+      - name: Test the read-only dashboard queue
+        run: .venv/bin/python -m unittest discover -s ../dashboard
+
+      - name: Test database role boundaries over a private Unix socket
+        run: |
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          .venv/bin/python ../db/test_review_permissions.py

@@ -94,6 +94,32 @@ class KillSwitchPathTests(TestCase):
             guard.check_stop()
         self.assertEqual(guard.events[-1].kind, "kill_switch")
 
+    def test_stop_file_created_during_final_shared_check_prevents_dispatch(self):
+        path = self.home / "x.kill"
+        shared = _not_stopped_shared()
+
+        def read_policy_after_reservation():
+            if shared.reserve.called:
+                path.touch()
+            return False
+
+        shared.stopped.side_effect = read_policy_after_reservation
+        guard = Guardrails(ScopeAllowlist(["example.invalid:80"]), RateLimiter(4),
+                           KillSwitch(path), shared=shared)
+        transport = Mock(return_value=httpx.Response(204, stream=httpx.ByteStream(b"")))
+        client = httpx.Client(transport=httpx.MockTransport(transport))
+        with patch("harness.executor.httpx.Client", return_value=client):
+            executor = Executor(guard)
+        self.addCleanup(executor.close)
+        executor._decoder = Mock()
+
+        with self.assertRaisesRegex(KillEngaged, "stop file"):
+            executor.send("GET", "http://example.invalid/me")
+
+        self.assertEqual(executor.request_count, 0)
+        transport.assert_not_called()
+        self.assertEqual(guard.events[-1].kind, "kill_switch")
+
     def test_dangling_symlink_engages(self):
         (self.home / "x.kill").symlink_to(self.home / "missing-target")
         self.assertTrue(KillSwitch("~/x.kill").engaged())
@@ -161,6 +187,10 @@ class ScopeAllowlistTests(TestCase):
         for entry in ("", ":80", "example.invalid:80/path", "example.invalid:80?q", "example.invalid:80#f"):
             with self.subTest(entry=entry), self.assertRaisesRegex(ValueError, "invalid scope entry"):
                 ScopeAllowlist([entry])
+
+    def test_scope_entry_with_fragment_before_port_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "^invalid scope entry, expected host:port$"):
+            ScopeAllowlist(["example.invalid#synthetic-fragment:8080"])
 
     def test_non_http_targets_are_denied(self):
         scope = ScopeAllowlist(["example.invalid:80"])

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+from contextlib import ExitStack
 
 from .config import Config, LAB_HOST, REPO
 from .targets import VampiTarget
@@ -55,7 +57,16 @@ def main() -> None:
     from .loop import run
 
     try:
-        report = run(cfg, target, spec, gt, args.program)
+        with ExitStack() as restore_logging:
+            # HTTP diagnostics can contain concrete URLs and raw response headers.
+            pending = [logging.getLogger(name) for name in ("httpx", "httpcore")]
+            while pending:
+                logger = pending.pop()
+                pending.extend(logger.getChildren())
+                if logger.level < logging.WARNING:
+                    restore_logging.callback(logger.setLevel, logger.level)
+                    logger.setLevel(logging.WARNING)
+            report = run(cfg, target, spec, gt, args.program)
     except KillEngaged:
         sys.exit(EXIT_KILLED)
     except ScopeViolation as exc:

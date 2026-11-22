@@ -248,6 +248,7 @@ from harness_guardrails.dispatch_policy where singleton
 # Confirmed + needs-review verdicts with their operation, probe, run and latest exchange.
 VERDICTS_SQL = """
 select v.id, extract(epoch from v.judged_at)::float as judged_at, v.label, v.severity, v.is_duplicate,
+  to_jsonb(v)->>'reviewed_by' as reviewed_by,
   v.evidence_ref, v.trace_id, o.run_id, r.target, r.status as run_status, o.method, o.path,
   p.id as probe_id, p.identity, p.tenant, p.role, p.intent,
   e.status_code, e.request_blob, e.response_blob
@@ -258,7 +259,7 @@ left join harness.runs r on r.id = o.run_id
 left join lateral (select x.status_code, x.request_blob, x.response_blob from harness.exchanges x
                    where x.probe_id = p.id order by x.id desc limit 1) e on true
 where {where}
-order by v.judged_at desc limit 5000
+order by {order} limit 5000
 """
 
 RUN_SQL = """
@@ -960,19 +961,24 @@ class Backend:
 
     # ---- findings / eval / run detail ----------------------------------------
 
-    async def verdict_rows(self, since: float | None = None, run_id: str | None = None) -> list[dict]:
-        """Verdicts joined to op/probe/run/exchange. By judged_at range, or every label for one run."""
+    async def verdict_rows(self, since: float | None = None, run_id: str | None = None,
+                           *, pending_only: bool = False) -> list[dict]:
+        """Read verdicts by date, for one run, or across the pending queue."""
         async def fetch():
             if not self.db_url:
                 raise ValueError("DASHBOARD_DATABASE_URL not set")
-            if run_id is not None:
+            order = "v.judged_at desc, v.id desc"
+            if pending_only:
+                where, params = "v.label = 'needs_review'", {}
+                order = "v.judged_at, v.id"
+            elif run_id is not None:
                 where, params = "o.run_id = %(id)s", {"id": run_id}
             else:
                 where = "v.judged_at >= %(since)s and v.label in ('confirmed', 'needs_review')"
                 params = {"since": datetime.fromtimestamp(since or 0, timezone.utc)}
             async with await self._db() as c:
-                return await (await c.execute(VERDICTS_SQL.format(where=where), params)).fetchall()
-        return await self.cache.get(("verdicts", since, run_id), 30, fetch)
+                return await (await c.execute(VERDICTS_SQL.format(where=where, order=order), params)).fetchall()
+        return await self.cache.get(("verdicts", since, run_id, pending_only), 30, fetch)
 
     def _with_lab(self, rows: list[dict]) -> list[dict]:
         lab = self.lab
@@ -990,11 +996,12 @@ class Backend:
         if not h.get("available"):
             return {"available": False, "error": h.get("error"), "rows": []}
         rows = self._with_lab(await self.verdict_rows(since))
+        pending = self._with_lab(await self.verdict_rows(pending_only=True))
         conf = [r for r in rows if r["label"] == "confirmed"]
         sev = Counter((r.get("severity") or "unrated").lower() for r in conf if r["finding"])
         return {
-            "available": True, "range": rng, "rows": rows,
-            "totals": {"findings": sum(1 for r in conf if r["finding"]), "needs_review": sum(1 for r in rows if r["label"] == "needs_review"),
+            "available": True, "range": rng, "rows": rows, "pending_rows": pending,
+            "totals": {"findings": sum(1 for r in conf if r["finding"]), "needs_review": len(pending),
                        "no_evidence": sum(1 for r in conf if not r.get("evidence_ref")),
                        "duplicates": sum(1 for r in conf if r.get("is_duplicate")),
                        "lab_fp": sum(1 for r in conf if r.get("outcome") == "fp"),

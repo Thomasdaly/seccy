@@ -1,10 +1,13 @@
 """CLI exit codes. The live run is replaced by a stub; nothing is dispatched."""
 
 import io
+import logging
 import os
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import TestCase
 from unittest.mock import patch
+
+import httpx
 
 import harness
 from harness import EXIT_DONE, EXIT_FAILED, EXIT_KILLED, exit_code
@@ -73,3 +76,40 @@ class MainTests(TestCase):
     def test_run_errors_propagate(self):
         with self.assertRaisesRegex(RuntimeError, "shared dispatch database unavailable"):
             self._main(raises=RuntimeError("shared dispatch database unavailable"))
+
+    def test_target_http_diagnostics_stay_private_with_root_debug_logging(self):
+        self._assert_http_diagnostics_stay_private(logging.NOTSET)
+
+    def test_target_http_diagnostics_stay_private_with_explicit_transport_debug_logging(self):
+        self._assert_http_diagnostics_stay_private(logging.DEBUG)
+
+    def _assert_http_diagnostics_stay_private(self, transport_level):
+        root = logging.getLogger()
+        configured_levels = {"httpx": logging.NOTSET, "httpcore": logging.NOTSET,
+                             "httpcore.http11": transport_level}
+        for name, level in configured_levels.items():
+            logger = logging.getLogger(name)
+            self.addCleanup(logger.setLevel, logger.level)
+            logger.setLevel(level)
+        self.addCleanup(root.setLevel, root.level)
+        root.setLevel(logging.DEBUG)
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        self.addCleanup(root.removeHandler, handler)
+        root.addHandler(handler)
+
+        def respond(request):
+            logging.getLogger("httpcore.http11").debug("canary header trace")
+            return httpx.Response(200, extensions={"reason_phrase": b"canary reason"})
+
+        def run(*args):
+            with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+                client.get("http://example.invalid/canary-title")
+            logging.getLogger("harness.test_cli").info("unrelated diagnostic")
+            return self._report("done")
+
+        self.assertEqual(self._exit(raises=run), 0)
+        self.assertNotIn("canary", output.getvalue())
+        self.assertIn("unrelated diagnostic", output.getvalue())
+        for name, level in configured_levels.items():
+            self.assertEqual(logging.getLogger(name).level, level, name)

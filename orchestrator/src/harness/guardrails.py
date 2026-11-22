@@ -40,7 +40,7 @@ class ScopeAllowlist:
                 if ":" in host and not host.startswith("["):
                     host = f"[{host}]"
                 url = httpx.URL(f"http://{host}:{port}")
-                if not port.isascii() or not port.isdecimal() or url.raw_path != b"/":
+                if not port.isascii() or not port.isdecimal() or url.raw_path != b"/" or url.fragment:
                     raise ValueError
                 self.entries.add(self.host_port(url))
             except (ValueError, httpx.InvalidURL, ScopeViolation):
@@ -113,14 +113,18 @@ class KillSwitch:
     def __init__(self, path: str | os.PathLike[str]):
         self.path = resolve_kill_switch_path(path)
 
-    def engaged(self) -> bool:
-        if os.environ.get("HARNESS_KILL") == "1":
+    def engaged(self, *, inspect_file: bool = False) -> bool:
+        environment_stop = os.environ.get("HARNESS_KILL") == "1"
+        if environment_stop and not inspect_file:
             return True
         try:
             self.path.lstat()
         except FileNotFoundError:
-            return False
+            return environment_stop
         except OSError:
+            # Diagnostics must surface inspection failures. Dispatch fails closed.
+            if inspect_file:
+                raise
             return True
         return True
 
@@ -151,12 +155,15 @@ class Guardrails:
         self.events.append(GuardrailEvent(kind, host, detail))
 
     def check_stop(self) -> None:
-        if self.kill.engaged():
-            detail = self.kill.detail()
-        elif self.shared.stopped():
-            detail = "engaged (shared dispatch policy)"
-        else:
+        local_stop = self.kill.engaged()
+        shared_stop = False
+        if not local_stop:
+            shared_stop = self.shared.stopped()
+            # The local stop can engage while the database read is in progress.
+            local_stop = self.kill.engaged()
+        if not local_stop and not shared_stop:
             return
+        detail = self.kill.detail() if local_stop else "engaged (shared dispatch policy)"
         self.record("kill_switch", None, detail)
         raise KillEngaged(detail)
 

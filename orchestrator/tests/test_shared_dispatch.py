@@ -1,5 +1,6 @@
 """The shared gate is exercised without target network access."""
 
+import traceback
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -19,6 +20,16 @@ class SharedDispatchTests(TestCase):
         self.kill = Mock(spec=KillSwitch, **{"engaged.return_value": False})
         self.guard = Guardrails(ScopeAllowlist(["example.invalid:80"]), RateLimiter(4),
                                 self.kill, shared=self.shared)
+        self.transport = Mock(side_effect=AssertionError("target transport was reached"))
+        client = httpx.Client(transport=httpx.MockTransport(self.transport))
+        with (patch("harness.executor.httpx.Client", return_value=client),
+              patch("harness.executor.ResponseDecoder")):
+            self.executor = Executor(self.guard)
+        self.addCleanup(self.executor.close)
+
+    def assert_no_dispatch(self):
+        self.assertEqual(self.executor.request_count, 0)
+        self.transport.assert_not_called()
 
     def test_missing_contact_information_refuses_live_dispatch(self):
         with self.assertRaisesRegex(RuntimeError, "HARNESS_DATABASE_URL"):
@@ -30,30 +41,45 @@ class SharedDispatchTests(TestCase):
             self.shared.lock_runner()
 
     def test_stop_engaged_while_waiting_prevents_permit(self):
-        self.cursor.fetchone.side_effect = [
-            (False,),  # initial stop check
-            (False,),  # local pacer stop check
-            (False,),  # shared permit unavailable
-            (True,),   # operator stopped while runner was waiting
-        ]
-        with patch("harness.guardrails.time.sleep", return_value=None):
-            with self.assertRaises(KillEngaged):
-                self.guard.guard_request("http://example.invalid/")
-        self.assertEqual(self.guard.events[-1].kind, "kill_switch")
+        stopped = False
+
+        def wait(_):
+            nonlocal stopped
+            self.assertFalse(stopped, "runner kept waiting after the shared stop")
+            stopped = True
+
+        def execute(sql):
+            if sql.startswith("select stopped"):
+                return Mock(**{"fetchone.return_value": (stopped,)})
+            return Mock(**{"fetchone.return_value": (False,)})
+
+        self.connection.execute.side_effect = execute
+        with patch("harness.guardrails.time.sleep", side_effect=wait) as sleep:
+            with self.assertRaisesRegex(KillEngaged, "engaged \\(shared dispatch policy\\)"):
+                self.executor.send("GET", "http://example.invalid/me")
+        sleep.assert_called_once()
+        (event,) = self.guard.events
+        self.assertEqual((event.kind, event.host, event.detail),
+                         ("kill_switch", None, "engaged (shared dispatch policy)"))
+        self.assert_no_dispatch()
 
     def test_missing_policy_refuses_dispatch(self):
         self.cursor.fetchone.return_value = None
-        with self.assertRaisesRegex(RuntimeError, "shared dispatch policy"):
-            self.guard.guard_request("http://example.invalid/")
+        with self.assertRaisesRegex(RuntimeError, "^shared dispatch policy unavailable$"):
+            self.executor.send("GET", "http://example.invalid/me")
+        self.assert_no_dispatch()
+
+    def test_malformed_policy_rows_fail_closed_with_a_safe_reason(self):
+        for row in ((), (False, "synthetic-diagnostic"), ("synthetic-diagnostic",), (None,)):
+            with self.subTest(row=row):
+                self.cursor.fetchone.side_effect = [row, AssertionError("policy was read again")]
+                with self.assertRaisesRegex(RuntimeError, "^shared dispatch policy unavailable$"):
+                    self.executor.send("GET", "http://example.invalid/me")
+        self.assert_no_dispatch()
 
     def test_control_loss_prevents_target_transport(self):
         self.connection.execute.side_effect = psycopg.OperationalError("sensitive diagnostic")
-        transport = Mock(side_effect=AssertionError("target transport was reached"))
-        with patch("harness.executor.httpx.Client",
-                   return_value=httpx.Client(transport=httpx.MockTransport(transport))):
-            executor = Executor(self.guard)
-        self.addCleanup(executor.close)
-        with self.assertRaisesRegex(RuntimeError, "^shared dispatch control unavailable$"):
-            executor.send("GET", "http://example.invalid/me")
-        self.assertEqual(executor.request_count, 0)
-        transport.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "^shared dispatch control unavailable$") as raised:
+            self.executor.send("GET", "http://example.invalid/me")
+        self.assertNotIn("sensitive diagnostic", "".join(traceback.format_exception(raised.exception)))
+        self.assert_no_dispatch()
