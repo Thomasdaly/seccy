@@ -33,7 +33,22 @@ usage: scripts/remote.sh <cmd> [args]
   deploy [svc...]        git push 2060 HEAD:master, then up
   sh <cmd...>            run shell command in ~/harness on the box
   rev                    commit checked out on the box vs local HEAD
+  dispatch [status]      shared dispatch policy: stopped or allowed, and min interval
+  dispatch stop          stop live dispatch for every runner (no prompt)
+  dispatch start         allow live dispatch; needs a person at a terminal to confirm
 EOF
+}
+
+# Shared stop for all runners. Runs as the postgres superuser inside the
+# container: the orchestrator's role can read the flag but never change it.
+POLICY=harness_guardrails.dispatch_policy
+POLICY_SHOW="select case when stopped then 'stopped' else 'dispatch allowed' end || ' min_interval_ms=' || min_interval_ms from $POLICY where singleton"
+policy_sql() { dc exec -T postgres psql -U postgres -qtAX -v ON_ERROR_STOP=1 -c "$1" </dev/null; }
+policy_show() {
+  local state
+  state=$(policy_sql "$POLICY_SHOW")
+  [ -n "$state" ] || { echo "dispatch policy row missing: apply db/harness.sql (runners refuse to dispatch)" >&2; return 1; }
+  echo "$state"
 }
 
 cmd=${1:-}; [ $# -gt 0 ] && shift
@@ -87,6 +102,30 @@ case "$cmd" in
     echo "local: $(git log --oneline -1)"
     dirty=$(on_box 'git status --porcelain --untracked-files=no')
     [ -z "$dirty" ] || { echo "box has uncommitted tracked changes:"; echo "$dirty"; }
+    ;;
+  dispatch)
+    case "${1:-status}" in
+      status)
+        policy_show
+        ;;
+      stop)
+        policy_sql "update $POLICY set stopped = true where singleton"
+        policy_show
+        ;;
+      start)
+        # Deliberately not scriptable: allowing live traffic is a human decision
+        # made for an attended run. Stop it again afterwards.
+        if [ ! -t 0 ] || [ ! -t 1 ]; then
+          echo "dispatch start needs an interactive terminal: a person must confirm live dispatch" >&2
+          exit 2
+        fi
+        read -r -p "Allow live dispatch for every runner using this database? Type 'start' to confirm: " answer
+        [ "$answer" = "start" ] || { echo "not started; dispatch remains stopped" >&2; exit 1; }
+        policy_sql "update $POLICY set stopped = false where singleton"
+        policy_show
+        ;;
+      *) usage; exit 2 ;;
+    esac
     ;;
   *) usage; [ -z "$cmd" ] || exit 2 ;;
 esac

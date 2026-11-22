@@ -6,14 +6,38 @@ OpenAPI spec and prints the operation inventory.
     uv run harness --target vampi --dry-run
 
 Live lab runs write redacted artifacts and record probes as needing manual
-review. The CLI returns 1 when no confirmed findings are available and 130 when
-stopped. It does not send lab data to models or Qdrant.
+review. It does not send lab data to models or Qdrant. Only a human review
+confirms a finding.
+
+A completed run also checks each probe's deterministic signal against the lab
+ground truth and writes the result to `signal_eval` in `_report.json`. It lists
+the authz findings that were signalled or missed, and the false positives. A
+signal on the secure twin for a gated finding is a false positive, and that
+finding does not count towards recall. A finding counts as gated unless the
+ground truth sets `gated: false`. Use the signal eval to compare probe changes
+between runs. It is not a list of findings, it does not change database
+verdicts, and a stopped run has none.
+
+Each probe artifact records the probe, finding and category IDs, the signal
+and secure-twin signal, and redacted attacker and control exchanges. An
+exchange records the method, origin, route template (such as
+`/books/v1/{book_title}`), status, content kind (`json`, `text` or `other`),
+response size in bytes, and an error kind from a fixed list. It never records
+the concrete path, query, headers or response values. Body values become
+`[redacted]`, apart from booleans and nulls under known keys.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Run completed (`status` `done`). Evidence still needs manual review; this does not mean findings were confirmed. |
+| 130 | Stopped by the stop file, `HARNESS_KILL=1`, the shared stop, or Ctrl-C (`status` `killed`). |
+| 1 | Run failed, or a scope violation was refused (the message starts with `scope violation:`). |
+| 2 | Invalid command-line arguments. |
 
 | Variable | Default | Meaning |
 |---|---|---|
 | HARNESS_SCOPE_ALLOWLIST | VAmPI lab twins | Permitted host:port entries. An explicitly empty value denies all requests. Lab addressing is independent of LiteLLM. |
 | HARNESS_RATE_LIMIT_RPS | 4 | Finite positive local request ceiling. The shared policy can impose a slower rate. |
-| HARNESS_KILL_SWITCH | .kill | Stop file. Relative paths resolve from the repository root. |
+| HARNESS_KILL_SWITCH | .kill | Stop file. A leading `~` expands to the home directory first, so `~/x.kill` is `$HOME/x.kill`. Other relative paths resolve from the repository root, so `.kill` is `<repo>/.kill`. |
 | HARNESS_KILL | unset | Set to 1 in the runner environment to prevent dispatch. Use the file to stop an existing process. |
 | HARNESS_DATABASE_URL | unset | Required for live runs. Use the same direct, session-preserving Postgres database for all runners. |
 | HARNESS_ARTIFACTS_DIR | artifacts | Directory for private, redacted artifacts and the run report. |
@@ -23,6 +47,18 @@ stopped with a 250 ms minimum interval. The database operator controls
 `harness_guardrails.dispatch_policy.stopped` and `min_interval_ms`. The runner
 can read the stop signal and reserve a permit, and its role cannot change the
 operator's settings. Applying the schema again preserves the policy.
+
+Keep the policy stopped except during an attended run. The operator commands
+run as the Postgres superuser on the services box:
+
+    scripts/remote.sh dispatch            # show the state and minimum interval
+    scripts/remote.sh dispatch start      # allow dispatch; asks you to type "start"
+    scripts/remote.sh dispatch stop       # stop every runner at its next check
+
+`start` only works from an interactive terminal, and refuses a piped or
+scripted confirmation. This prevents an accidental start. It does not
+authenticate the person typing. `stop` never prompts. Run it after each
+attended run, and whenever a run needs to stop on every runner.
 
 The gate allows one live run across all runners using the same database. A
 local stop file, a shared stop, or an unavailable policy prevents further

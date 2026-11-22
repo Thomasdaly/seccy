@@ -6,12 +6,11 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable
 
 import httpx
 
-from .config import REPO
+from .config import resolve_kill_switch_path
 from .shared_dispatch import SharedDispatch
 
 
@@ -111,8 +110,8 @@ class RateLimiter:
 class KillSwitch:
     """Local emergency stop via a file or the runner's environment."""
 
-    def __init__(self, path: str):
-        self.path = Path(path).expanduser().absolute()
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = resolve_kill_switch_path(path)
 
     def engaged(self) -> bool:
         if os.environ.get("HARNESS_KILL") == "1":
@@ -144,7 +143,7 @@ class Guardrails:
         return cls(
             scope=ScopeAllowlist(cfg.scope_allowlist),
             rate=RateLimiter(cfg.rate_limit_rps),
-            kill=KillSwitch(str(REPO / Path(cfg.kill_switch_file).expanduser())),
+            kill=KillSwitch(cfg.kill_switch_file),
             shared=shared,
         )
 

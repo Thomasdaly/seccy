@@ -5,7 +5,7 @@
 --
 -- Orchestrator contract (what the dashboard reads):
 --   runs.id            = LiteLLM metadata session_id on every call of the run
---   probes.interesting = glue's looks_interesting(obs) verdict
+--   probes.interesting = the probe's deterministic signal (null if the probe failed)
 --   verdicts.evidence_ref must point at a replayable request/response pair;
 --   confirmed + evidence + not duplicate = a finding.
 

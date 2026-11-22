@@ -46,19 +46,68 @@ def _evidence_origin(url: str) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc.decode('ascii')}"
 
 
+# The only method + path shapes the executor will dispatch. Each pattern must
+# match the whole raw path (which includes any "?"); the template is what
+# evidence records instead of the concrete path, so object identifiers such as
+# usernames and titles never reach artifacts.
+_SEGMENT = rb"[A-Za-z0-9_-]+"
+_ROUTES: tuple[tuple[str, re.Pattern[bytes], str], ...] = (
+    ("GET", re.compile(rb"/books/v1"), "/books/v1"),
+    ("GET", re.compile(rb"/me"), "/me"),
+    ("GET", re.compile(rb"/users/v1/_debug"), "/users/v1/_debug"),
+    ("GET", re.compile(rb"/books/v1/" + _SEGMENT), "/books/v1/{book_title}"),
+    ("POST", re.compile(rb"/users/v1/login"), "/users/v1/login"),
+    ("POST", re.compile(rb"/users/v1/register"), "/users/v1/register"),
+    ("PUT", re.compile(rb"/users/v1/" + _SEGMENT + rb"/password"), "/users/v1/{username}/password"),
+)
+
+
+def _route_template(method: str, raw_path: bytes) -> str | None:
+    for allowed_method, pattern, template in _ROUTES:
+        if method == allowed_method and pattern.fullmatch(raw_path):
+            return template
+    return None
+
+
 def _allowed_route(request: httpx.Request) -> bool:
     if request.url.query or request.url.fragment:
         return False
-    path = request.url.raw_path
-    if request.method == "GET":
-        return path in {b"/books/v1", b"/me", b"/users/v1/_debug"} or bool(
-            re.fullmatch(rb"/books/v1/[A-Za-z0-9_-]+", path)
-        )
-    if request.method == "POST":
-        return path in {b"/users/v1/login", b"/users/v1/register"}
-    if request.method == "PUT":
-        return bool(re.fullmatch(rb"/users/v1/[A-Za-z0-9_-]+/password", path))
-    return False
+    return _route_template(request.method, request.url.raw_path) is not None
+
+
+def _evidence_route(method: str, url: str) -> str | None:
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL:
+        return None
+    if parsed.query or parsed.fragment:
+        return None
+    return _route_template(method, parsed.raw_path)
+
+
+# Exchange.error values are set only by this module: fixed strings or httpx
+# exception class names. Evidence records a closed vocabulary, never free text.
+_ERROR_KINDS = {
+    "identity_unavailable", "unsupported_response_encoding", "response_limit",
+    "invalid_json", "decoder_unavailable",
+}
+
+
+def _error_kind(error: str | None) -> str | None:
+    if error is None:
+        return None
+    if error in _ERROR_KINDS:
+        return error
+    return "timeout" if error.endswith("Timeout") else "transport_error"
+
+
+def _content_kind(content_type: str) -> str | None:
+    media = content_type.split(";", 1)[0].strip().lower()
+    if not media:
+        return None
+    if "json" in media:
+        return "json"
+    return "text" if media.startswith("text/") else "other"
 
 
 @dataclass
@@ -72,19 +121,26 @@ class Exchange:
     response_headers: dict[str, str] = field(default_factory=dict)
     response_body: Any = None
     error: str | None = None
+    content_kind: str | None = None    # json | text | other, derived from Content-Type
+    response_bytes: int | None = None  # body size when it was read in full
 
     def to_evidence(self) -> dict:
+        """Derived, review-safe fields only: no concrete path, query, headers or values."""
         return {
             "request": {
                 "method": self.method,
                 "origin": _evidence_origin(self.url),
+                "route": _evidence_route(self.method, self.url),
                 "body": _redact_body(self.request_body),
             },
             "response": {
                 "status": self.status_code,
+                "content_kind": self.content_kind,
+                "bytes": self.response_bytes,
                 "body": _redact_body(self.response_body),
             },
             "error": self.error is not None,
+            "error_kind": _error_kind(self.error),
         }
 
 
@@ -145,6 +201,7 @@ class Executor:
     def _capture(self, request: httpx.Request, exchange: Exchange, deadline: float) -> None:
         with closing(self._client.send(request, stream=True)) as response:
             exchange.status_code = response.status_code
+            exchange.content_kind = _content_kind(response.headers.get("content-type", ""))
             if response.headers.get("content-encoding", "identity").lower() != "identity":
                 exchange.error = "unsupported_response_encoding"
                 return
@@ -158,6 +215,7 @@ class Executor:
             if time.monotonic() >= deadline:
                 exchange.error = "response_limit"
                 return
+            exchange.response_bytes = len(body)
             if "json" in response.headers.get("content-type", "").lower():
                 try:
                     exchange.response_body = self._decoder.decode(bytes(body), deadline - time.monotonic())

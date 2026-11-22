@@ -8,6 +8,25 @@ from .config import Config, LAB_HOST, REPO
 from .targets import VampiTarget
 
 
+EXIT_DONE = 0
+EXIT_FAILED = 1
+EXIT_KILLED = 130
+
+
+def exit_code(status: str) -> int:
+    """Map a run status to the CLI exit code.
+
+    ``done`` means the run completed and its evidence awaits manual review; it
+    says nothing about findings. Any status other than ``done`` or ``killed``
+    is a failure. Uncaught errors also exit non-zero.
+    """
+    if status == "done":
+        return EXIT_DONE
+    if status == "killed":
+        return EXIT_KILLED
+    return EXIT_FAILED
+
+
 def _vampi() -> VampiTarget:
     return VampiTarget(f"http://{LAB_HOST}:5061", f"http://{LAB_HOST}:5062")
 
@@ -38,12 +57,10 @@ def main() -> None:
     try:
         report = run(cfg, target, spec, gt, args.program)
     except KillEngaged:
-        sys.exit(130)
+        sys.exit(EXIT_KILLED)
     except ScopeViolation as exc:
-        sys.exit(str(exc))
-    if report.status == "killed":
-        sys.exit(130)
-    sys.exit(0 if report.confirmed_authz and not report.false_positives else 1)
+        sys.exit(f"scope violation: {exc}")
+    sys.exit(exit_code(report.status))
 
 
 def _dry_run(cfg: Config, spec: str) -> None:

@@ -25,6 +25,20 @@ REPO = Path(__file__).resolve().parents[3]
 LAB_HOST = "100.102.105.11"
 
 
+def resolve_kill_switch_path(raw: str | os.PathLike[str]) -> Path:
+    """Expand ``~`` first, then anchor relative paths at the repository root.
+
+    ``~/x.kill`` becomes ``$HOME/x.kill`` and ``.kill`` becomes ``REPO/.kill``.
+    Absolute paths are kept as given. Symlinks are not followed, so the stop
+    file may itself be a (possibly dangling) link.
+    """
+    try:
+        path = Path(raw).expanduser()
+    except RuntimeError:
+        raise ValueError("HARNESS_KILL_SWITCH: could not expand the home directory") from None
+    return path if path.is_absolute() else REPO / path
+
+
 @dataclass(frozen=True)
 class Config:
     # --- model router (LiteLLM, OpenAI-compatible) ---
@@ -43,7 +57,7 @@ class Config:
     )
     rate_limit_rps: float = field(default_factory=lambda: float(_env("HARNESS_RATE_LIMIT_RPS", "4") or "4"))
     kill_switch_file: str = field(
-        default_factory=lambda: str(REPO / (_env("HARNESS_KILL_SWITCH", ".kill") or ".kill"))
+        default_factory=lambda: str(resolve_kill_switch_path(_env("HARNESS_KILL_SWITCH", ".kill") or ".kill"))
     )
 
     # --- shared live dispatch policy and persistence ---
