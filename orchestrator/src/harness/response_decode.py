@@ -48,11 +48,26 @@ class ResponseDecoder:
             Path("/Library/Apple/System/Library"),
             Path(sysconfig.get_path("stdlib")).resolve(),
         }
-        files = {interpreter, Path("/dev/null")}
-        libdir = sysconfig.get_config_var("LIBDIR")
-        libpython = sysconfig.get_config_var("LDLIBRARY")
-        if libdir and libpython:
-            files.add((Path(libdir) / libpython).resolve())
+        files = {Path("/dev/null")}
+
+        # Framework builds load the version's framework binary. LDLIBRARY can
+        # be relative to the framework's parent, so joining it to LIBDIR misses it.
+        framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+        version_dir = interpreter.parent.parent
+        if (framework and interpreter.parent.name == "bin" and version_dir.parent.name == "Versions"
+                and version_dir.parent.parent.name == f"{framework}.framework"):
+            files.add((version_dir / framework).resolve())
+            # Launch the bundled interpreter directly when present. Some
+            # framework launchers otherwise try to spawn it inside the sandbox.
+            bundled_python = (version_dir / "Resources/Python.app/Contents/MacOS/Python").resolve()
+            if bundled_python.is_relative_to(version_dir) and bundled_python.is_file():
+                interpreter = bundled_python
+        else:
+            libdir = sysconfig.get_config_var("LIBDIR")
+            libpython = sysconfig.get_config_var("LDLIBRARY")
+            if libdir and libpython:
+                files.add((Path(libdir) / libpython).resolve())
+        files.add(interpreter)
 
         ancestors = {parent for path in directories | files for parent in path.parents}
         readable = [f"(subpath {json.dumps(str(path))})" for path in sorted(directories)]

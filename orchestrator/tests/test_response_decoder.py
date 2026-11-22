@@ -1,5 +1,6 @@
 """Response decoding tests use synthetic input only."""
 
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,36 @@ from harness.response_decode import ResponseDecodeError, ResponseDecoder
 
 
 class ResponseDecoderTests(TestCase):
+    def test_framework_interpreter_gets_a_literal_permission_for_its_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            framework = Path(directory).resolve() / "Python.framework"
+            version = framework / "Versions" / "3.13"
+            interpreter = version / "bin" / "python3.13"
+            config = {
+                "LIBDIR": str(version / "lib"),
+                "LDLIBRARY": "Python.framework/Versions/3.13/Python",
+                "PYTHONFRAMEWORK": "Python",
+            }
+            bundled_python = version / "Resources/Python.app/Contents/MacOS/Python"
+            for executable in (interpreter, bundled_python):
+                with self.subTest(executable=executable.name):
+                    if executable == bundled_python:
+                        bundled_python.parent.mkdir(parents=True)
+                        bundled_python.touch()
+                    with (patch("harness.response_decode.sys.platform", "darwin"),
+                          patch("harness.response_decode.sys.executable", str(interpreter)),
+                          patch("harness.response_decode.sysconfig.get_config_var", side_effect=config.get),
+                          patch("harness.response_decode.sysconfig.get_path",
+                                return_value=str(version / "lib/python3.13"))):
+                        _, _, profile, selected, *_ = ResponseDecoder()._command()
+
+                    self.assertEqual(selected, str(executable))
+                    self.assertIn(f"(literal {json.dumps(str(version / 'Python'))})", profile)
+                    old_library_path = version / "lib" / config["LDLIBRARY"]
+                    self.assertNotIn(f"(literal {json.dumps(str(old_library_path))})", profile)
+                    self.assertNotIn(f"(subpath {json.dumps(str(version))})", profile)
+                    self.assertNotIn(f"(subpath {json.dumps(str(framework))})", profile)
+
     def test_no_in_process_fallback(self):
         with patch("harness.response_decode.sys.platform", "unsupported"):
             with self.assertRaisesRegex(ResponseDecodeError, "decoder_unavailable"):
